@@ -2,6 +2,7 @@
 version: 2.1
 orbs:
   codecov: codecov/codecov@4.1.0
+  docker: circleci/docker@2.6.0
 
 parameters:
   build_all:
@@ -108,6 +109,57 @@ jobs:
       MAKE_JOB_COUNT: 8
       WAF: "<< parameters.waf >>"
       NGINX_VERSION: "<< parameters.nginx-version >>"
+  build_amd64_init_container:
+    parameters:
+      nginx-controller-version:
+        type: string
+      waf:
+        type: enum
+        enum:
+        - 'ON'
+        - 'OFF'
+    steps:
+    - checkout
+    - run: git submodule sync && git submodule update --init --recursive
+    - setup_remote_docker:
+        docker_layer_caching: true
+    - run:
+        name: Build the init container
+        command: |
+          case $NGINX_CONTROLLER_VERSION in
+              "v1.11.1"|"v1.11.0"|"v1.10.3"|"v1.10.2")
+                  NGINX_VERSION="1.25.5"
+                  ;;
+              "v1.10.1"|"v1.10.0")
+                  NGINX_VERSION="1.25.3"
+                  ;;
+              "v1.9.6"|"v1.9.5"|"v1.9.4"|"v1.9.3"|"v1.9.1"|"v1.9.0"|"v1.8.4")
+                  NGINX_VERSION="1.21.6"
+                  ;;
+              *)
+                  echo "Unsupported or out of range Ingress-NGINX version: $NGINX_CONTROLLER_VERSION"
+                  exit 1
+                  ;;
+          esac
+          docker build -t datadog/ingress-nginx-injection --platform linux/amd64 --build-arg "ARCH=$ARCH" --build-arg "WAF=$WAF" --build-arg "NGINX_VERSION=$NGINX_VERSION" -f injection/ingress-nginx/Dockerfile .
+        environment:
+          ARCH: x86_64
+          WAF: "<< parameters.waf >>"
+          NGINX_CONTROLLER_VERSION: "<< parameters.nginx-controller-version >>"
+    - run:
+        name: Boot up docker compose and test module
+        command: |
+          set -e
+          docker compose -f injection/ingress-nginx/docker-compose.yml up --exit-code-from requester
+        environment:
+          NGINX_CONTROLLER_VERSION: "<< parameters.nginx-controller-version >>"
+    - run: 
+        name: Login and publish to docker hub
+        command: |
+          echo "$PARAM_DOCKER_PASSWORD" | docker login -u "$PARAM_DOCKER_USERNAME" --password-stdin
+          docker push datadog/ingress-nginx-injection
+    docker:
+      - image: docker:25.0.5-git
   coverage:
     environment:
       DOCKER_BUILDKIT: 1
@@ -241,6 +293,16 @@ workflows:
             - 'ON'
             - 'OFF'
         name: build << matrix.nginx-version >> on arm64 WAF << matrix.waf >>
+    - build_amd64_init_container:
+        matrix:
+          parameters:
+            nginx-controller-version:
+            - 1.8.4
+            waf:
+            - 'OFF'
+        name: build images for Ingress NGINX << matrix.nginx-controller-version >> on amd64 WAF << matrix.waf >>
+        context:
+          - nginx-datadog-dockerhub
     - coverage:
         name: Coverage on 1.27.0 with WAF ON
     - test:

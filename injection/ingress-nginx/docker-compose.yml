@@ -1,0 +1,69 @@
+# Emulate what the Cluster Agent does as closely as possible.
+# The Cluster Agent creates an InitContainer with the init image and runs the init_module.sh script.
+# It then patches the pods to include the PYTHONPATH environment variable and the volume mount.
+services:
+  lib_inject:
+    image: datadog/ingress-nginx-injection
+    # Ensure we are using the local image
+    pull_policy: never
+    volumes:
+      # A host mount is used rather than named volumes as they run into permission issues when copying files.
+      # The injection image is run with a non-root user which does not have permission to write to the named volume.
+      - /tmp/modules_mount:/modules_mount
+    # --exit-code-from implies --abort-on-container-exit
+    # tail null to keep this container running so we can retrieve the exit value from requester
+    # We need to boot up a curl host because CircleCI won't allow for port mapping externally
+    command: >
+      sh -c "/usr/local/bin/init_module.sh && tail -f /dev/null"
+
+  # testagent is used to collect data from the library to validate.
+  testagent:
+    image: ghcr.io/datadog/dd-apm-test-agent/ddapm-test-agent:v1.11.0
+
+  # app is parametrized to generically run images with the library injected and submit data to the test agent.
+  app:
+    depends_on:
+      - lib_inject
+      - testagent
+    image: registry.k8s.io/ingress-nginx/controller:${NGINX_CONTROLLER_VERSION}
+    environment:
+      - DD_TRACE_AGENT_URL=http://testagent:8126
+      - DD_AGENT_HOST=testagent
+    volumes:
+      - /tmp/modules_mount:/datadog-lib
+    command: >
+      sh -c "
+        echo 'pid /tmp/nginx/nginx.pid;
+              events {}
+              http {
+                  server {
+                      listen 80;
+                      location / {
+                          index index.html;
+                      }
+                  }
+              }
+              daemon off;' > /etc/nginx/nginx.conf
+        nginx -g 'load_module /datadog-lib/ngx_http_datadog_module.so;'
+      "
+
+  # requester calls the app, generating traces, then checks the test agent for traces
+  requester:
+    depends_on:
+      - app
+    image: curlimages/curl:8.8.0
+    # Curl the app, then curl /test/traces until an nginx trace was found, max 10 attempts
+    command: >
+      sh -c '
+        set -e &&
+        curl -X GET http://app:80 &&
+        for i in $(seq 1 10); do
+          if curl -s -X GET http://testagent:8126/test/traces | grep -q nginx.request; then
+            exit 0
+          elif [ $$i -eq 10 ]; then
+            exit 1
+          else
+            sleep 1
+          fi
+        done
+      '
