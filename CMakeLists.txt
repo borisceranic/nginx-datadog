@@ -71,6 +71,12 @@ if(NGINX_DATADOG_ASM_ENABLED)
   file(READ ./libddwaf/version LIBDDWAF_VERSION)
 endif()
 
+include(./cmake/generate_build_id.cmake)
+
+# Generate the build identifier.
+# Known issue: this command is only run during the CMake configuration stage.
+# Possible solution: <https://jonathanhamberg.com/post/cmake-embedding-git-hash/>
+make_build_id(NGINX_DATADOG_BUILD_ID)
 configure_file(src/version.cpp.in ${CMAKE_BINARY_DIR}/version.cpp)
 
 # The shared library (nginx module) that we are building.

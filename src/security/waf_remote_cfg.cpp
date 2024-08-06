@@ -1,5 +1,8 @@
 #include "waf_remote_cfg.h"
 
+#include <datadog/remote_config/capability.h>
+#include <datadog/remote_config/product.h>
+#include <datadog/string_view.h>
 #include <ddwaf.h>
 #include <rapidjson/document.h>
 #include <rapidjson/error/en.h>
@@ -7,9 +10,11 @@
 #include <rapidjson/rapidjson.h>
 
 #include <algorithm>
-#include <datadog/json_fwd.hpp>
+#include <charconv>
+#include <datadog/json.hpp>
 #include <optional>
 #include <ostream>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <type_traits>
@@ -18,11 +23,91 @@
 #include "ddwaf_obj.h"
 #include "library.h"
 
-namespace rc = datadog::tracing::remote_config;
+namespace rc = datadog::remote_config;
 namespace dnsec = datadog::nginx::security;
 using namespace std::literals;
+using dd::StringView;
+using Product = rc::product::Flag;
+using Capability = rc::capability::Flag;
 
 namespace {
+
+// A configuration key has the form:
+// (datadog/<org_id> | employee)/<PRODUCT>/<config_id>/<name>"
+class ParsedConfigKey {
+ public:
+  explicit ParsedConfigKey(std::string key) : key_{std::move(key)} {
+    parse_config_key();
+  }
+  ParsedConfigKey(const ParsedConfigKey &oth) : ParsedConfigKey(oth.key_) {
+    parse_config_key();
+  }
+  ParsedConfigKey &operator=(const ParsedConfigKey &oth) {
+    if (&oth != this) {
+      key_ = oth.key_;
+      parse_config_key();
+    }
+    return *this;
+  }
+  ParsedConfigKey(ParsedConfigKey &&oth) noexcept
+      : key_{std::move(oth.key_)},
+        source_{oth.source()},
+        org_id_{oth.org_id_},
+        product_{oth.product_},
+        config_id_{oth.config_id_},
+        name_{oth.name_} {
+    oth.source_ = {};
+    oth.org_id_ = 0;
+    oth.product_ = Product::UNKNOWN;
+    oth.config_id_ = {};
+    oth.name_ = {};
+  }
+  ParsedConfigKey &operator=(ParsedConfigKey &&oth) noexcept {
+    if (&oth != this) {
+      key_ = std::move(oth.key_);
+      source_ = oth.source_;
+      org_id_ = oth.org_id_;
+      product_ = oth.product_;
+      config_id_ = oth.config_id_;
+      name_ = oth.name_;
+      oth.source_ = {};
+      oth.org_id_ = 0;
+      oth.product_ = Product::UNKNOWN;
+      oth.config_id_ = {};
+      oth.name_ = {};
+    }
+    return *this;
+  }
+  ~ParsedConfigKey() = default;
+
+  bool operator==(const ParsedConfigKey &other) const {
+    return key_ == other.key_;
+  }
+
+  struct Hash {
+    std::size_t operator()(const ParsedConfigKey &k) const {
+      return std::hash<std::string>()(k.key_);
+    }
+  };
+
+  // lifetime of return values is that of the data pointer in key_
+  StringView full_key() const { return {key_}; }
+  StringView source() const { return source_; }
+  std::uint64_t org_id() const { return org_id_; }
+  Product product() const { return product_; }
+  StringView config_id() const { return config_id_; }
+  StringView name() const { return name_; }
+
+ private:
+  void parse_config_key();
+
+  std::string key_;
+  StringView source_;
+  std::uint64_t org_id_{};
+  Product product_{Product::UNKNOWN};
+  StringView config_id_;
+  StringView name_;
+};
 
 struct DirtyStatus {
   bool rules;
@@ -54,7 +139,7 @@ struct DirtyStatus {
 };
 
 class AppSecUserConfig {
-  rc::ParsedConfigKey key_;
+  ParsedConfigKey key_;
   dnsec::ddwaf_owned_map root_;
   // these are all arrays of maps: [{id: "...", ...}, ...]
   dnsec::ddwaf_arr_obj rules_override_;
@@ -63,7 +148,7 @@ class AppSecUserConfig {
   dnsec::ddwaf_arr_obj custom_rules_;
 
  public:
-  AppSecUserConfig(rc::ParsedConfigKey key, dnsec::ddwaf_owned_map root)
+  AppSecUserConfig(ParsedConfigKey key, dnsec::ddwaf_owned_map root)
       : key_{key}, root_{std::move(root)} {
     if (auto rules_override = root_.get().get_opt("rules_override"sv)) {
       rules_override_.shallow_copy_val_from(rules_override.value());
@@ -79,7 +164,7 @@ class AppSecUserConfig {
     }
   }
 
-  const rc::ParsedConfigKey &key() const { return key_; }
+  const ParsedConfigKey &key() const { return key_; }
   const dnsec::ddwaf_arr_obj &rules_override() const { return rules_override_; }
   const dnsec::ddwaf_arr_obj &actions() const { return actions_; }
   const dnsec::ddwaf_arr_obj &exclusions() const { return exclusions_; }
@@ -95,7 +180,7 @@ class AppSecUserConfig {
             !exclusions_.empty()};
   }
 
-  static AppSecUserConfig from_json(rc::ParsedConfigKey key,
+  static AppSecUserConfig from_json(ParsedConfigKey key,
                                     rapidjson::Document &json) {
     if (!json.IsObject()) {
       throw std::invalid_argument("user config json not a map");
@@ -111,7 +196,7 @@ class AppSecUserConfig {
 class CollectedUserConfigs {
   std::vector<AppSecUserConfig> user_configs_;
 
-  auto find_by_key(const rc::ParsedConfigKey &key) {
+  auto find_by_key(const ParsedConfigKey &key) {
     return std::find_if(
         user_configs_.begin(), user_configs_.end(),
         [&key](const AppSecUserConfig &cfg) { return cfg.key() == key; });
@@ -132,7 +217,7 @@ class CollectedUserConfigs {
     return removed_dirty | new_dirty;
   }
 
-  DirtyStatus remove_config(const rc::ParsedConfigKey &key) {
+  DirtyStatus remove_config(const ParsedConfigKey &key) {
     auto it = find_by_key(key);
     if (it == user_configs_.end()) {
       return DirtyStatus{};  // nothing dirty
@@ -154,17 +239,17 @@ class CollectedUserConfigs {
 };
 
 class CollectedAsmData {
-  std::unordered_map<rc::ParsedConfigKey, dnsec::ddwaf_owned_arr /*arr*/,
-                     rc::ParsedConfigKey::Hash>
+  std::unordered_map<ParsedConfigKey, dnsec::ddwaf_owned_arr /*arr*/,
+                     ParsedConfigKey::Hash>
       data_;
 
  public:
-  void add_config(const rc::ParsedConfigKey &key,
+  void add_config(const ParsedConfigKey &key,
                   dnsec::ddwaf_owned_arr new_config) {
     data_.emplace(key, std::move(new_config));
   }
 
-  void remove_config(const rc::ParsedConfigKey &key) { data_.erase(key); }
+  void remove_config(const ParsedConfigKey &key) { data_.erase(key); }
 
   // returns [{id: "...", type: "...", data: [{...}, ...]}]
   // by merging the data value from all entries with the same id
@@ -249,7 +334,7 @@ class CurrentAppSecConfig {
 
  public:
   void set_dd_config(std::shared_ptr<dnsec::ddwaf_owned_map> new_config) {
-    static const rc::ParsedConfigKey key_bundled_rule_data{
+    static const ParsedConfigKey key_bundled_rule_data{
         "datadog/0/NONE/none/bundled_rule_data"};
 
     assert(new_config);
@@ -269,13 +354,13 @@ class CurrentAppSecConfig {
     dirty_status_.rules = true;
   }
 
-  void asm_data_add_config(const rc::ParsedConfigKey &key,
+  void asm_data_add_config(const ParsedConfigKey &key,
                            dnsec::ddwaf_owned_arr new_config) {
     asm_data_.add_config(key, std::move(new_config));
     dirty_status_.data = true;
   }
 
-  void asm_data_remove_config(const rc::ParsedConfigKey &key) {
+  void asm_data_remove_config(const ParsedConfigKey &key) {
     asm_data_.remove_config(key);
     dirty_status_.data = true;
   }
@@ -284,7 +369,7 @@ class CurrentAppSecConfig {
     dirty_status_ |= user_configs_.add_config(std::move(new_config));
   }
 
-  void user_config_remove_config(const rc::ParsedConfigKey &key) {
+  void user_config_remove_config(const ParsedConfigKey &key) {
     dirty_status_ |= user_configs_.remove_config(key);
   }
 
@@ -479,7 +564,49 @@ class JsonParsedConfig {
   nlohmann::json json_;
 };
 
-class AsmFeaturesListener : public rc::ProductListener {
+class ProductListener : public rc::Listener {
+ protected:
+  ProductListener(Product product,
+                  std::initializer_list<Capability> capabilities)
+      : product_{product} {
+    for (auto c : capabilities) {
+      capabilities_ |= c;
+    }
+  }
+
+  rc::Products get_products() /* const */ override final { return product_; }
+
+  rc::Capabilities get_capabilities() /* const */ override final {
+    return capabilities_;
+  }
+
+  virtual void on_update(const ParsedConfigKey &key,
+                         const std::string &content) = 0;
+
+  dd::Optional<std::string> on_update(
+      const Configuration &config) override final {
+    try {
+      on_update(ParsedConfigKey{config.path}, config.content);
+      return {};
+    } catch (const std::exception &e) {
+      return e.what();
+    }
+  };
+
+  virtual void on_revert(const ParsedConfigKey &key) = 0;
+
+  void on_revert(const Configuration &config) override final {
+    on_revert(ParsedConfigKey{config.path});
+  }
+
+  void on_post_process() override {}
+
+ private:
+  rc::Products product_;
+  rc::Capabilities capabilities_{};
+};
+
+class AsmFeaturesListener : public ProductListener {
   class AppSecFeatures : public JsonParsedConfig {
    public:
     using JsonParsedConfig::JsonParsedConfig;
@@ -495,11 +622,10 @@ class AsmFeaturesListener : public rc::ProductListener {
 
  public:
   AsmFeaturesListener()
-      : rc::ProductListener{rc::Product::KnownProducts::ASM_FEATURES} {}
+      : ProductListener{Product::ASM_FEATURES, {Capability::ASM_ACTIVATION}} {}
 
-  void on_config_update(const rc::ParsedConfigKey &key,
-                        const std::string &content,
-                        std::vector<dd::ConfigMetadata> &) override {
+  void on_update(const ParsedConfigKey &key,
+                 const std::string &content) override {
     if (key.config_id() != "asm_features_activation"sv) {
       return;
     }
@@ -512,29 +638,28 @@ class AsmFeaturesListener : public rc::ProductListener {
     }
 
     dnsec::Library::set_active(new_state);
-  }
-
-  void on_config_remove(const rc::ParsedConfigKey &key,
-                        std::vector<dd::ConfigMetadata> &config_md) override {
-    return on_config_update(key, std::string{"{}"}, config_md);
   };
 
-  rc::CapabilitiesSet capabilities() const override {
-    return rc::Capability::ASM_ACTIVATION;
+  void on_revert(const ParsedConfigKey &key) override {
+    return on_update(key, std::string{"{}"});
   };
 };
 
-class AsmDDListener : public rc::ProductListener {
+class AsmDDListener : public ProductListener {
  public:
   AsmDDListener(CurrentAppSecConfig &cur_appsec_cfg,
                 std::shared_ptr<dnsec::ddwaf_owned_map> default_config)
-      : rc::ProductListener{rc::Product::KnownProducts::ASM_DD},
+      : ProductListener{Product::ASM_DD,
+                        {
+                            Capability::ASM_DD_RULES,
+                            Capability::ASM_IP_BLOCKING,
+                            Capability::ASM_REQUEST_BLOCKING,
+                        }},
         cur_appsec_cfg_{cur_appsec_cfg},
         default_config_{default_config} {}
 
-  void on_config_update(const rc::ParsedConfigKey &key,
-                        const std::string &content,
-                        std::vector<dd::ConfigMetadata> &) override {
+  void on_update(const ParsedConfigKey &key,
+                 const std::string &content) override {
     // convert content to rapidjson::Document:
     rapidjson::Document doc;
     rapidjson::ParseResult result = doc.Parse(content.c_str(), content.size());
@@ -551,35 +676,25 @@ class AsmDDListener : public rc::ProductListener {
     cur_appsec_cfg_.set_dd_config(std::move(new_config));
   }
 
-  void on_config_remove(const rc::ParsedConfigKey &key,
-                        std::vector<dd::ConfigMetadata> &) override {
+  void on_revert(const ParsedConfigKey &key) override {
     cur_appsec_cfg_.set_dd_config(default_config_);
   }
-
-  rc::CapabilitiesSet capabilities() const override {
-    return {
-        rc::Capability::ASM_DD_RULES,
-        rc::Capability::ASM_IP_BLOCKING,
-        rc::Capability::ASM_REQUEST_BLOCKING,
-    };
-  };
 
  private:
   CurrentAppSecConfig &cur_appsec_cfg_;
   std::shared_ptr<dnsec::ddwaf_owned_map> default_config_;
 };
 
-class AsmDataListener : public rc::ProductListener {
+class AsmDataListener : public ProductListener {
  public:
   AsmDataListener(CurrentAppSecConfig &cur_appsec_cfg,
                   datadog::tracing::Logger &logger)
-      : rc::ProductListener{rc::Product::KnownProducts::ASM_DATA},
+      : ProductListener{Product::ASM_DATA, {}},
         cur_appsec_cfg_{cur_appsec_cfg},
         logger_{logger} {}
 
-  void on_config_update(const rc::ParsedConfigKey &key,
-                        const std::string &content,
-                        std::vector<dd::ConfigMetadata> &) override {
+  void on_update(const ParsedConfigKey &key,
+                 const std::string &content) override {
     rapidjson::Document doc;
     rapidjson::ParseResult result = doc.Parse(content.c_str(), content.size());
     if (!result) {
@@ -616,27 +731,23 @@ class AsmDataListener : public rc::ProductListener {
     }
   }
 
-  void on_config_remove(const rc::ParsedConfigKey &key,
-                        std::vector<dd::ConfigMetadata> &) override {
+  void on_revert(const ParsedConfigKey &key) override {
     cur_appsec_cfg_.asm_data_remove_config(key);
   }
-
-  rc::CapabilitiesSet capabilities() const override { return {}; };
 
  private:
   CurrentAppSecConfig &cur_appsec_cfg_;
   datadog::tracing::Logger &logger_;
 };
 
-class AsmUserConfigListener : public rc::ProductListener {
+class AsmUserConfigListener : public ProductListener {
  public:
   AsmUserConfigListener(CurrentAppSecConfig &cur_appsec_cfg)
-      : rc::ProductListener{rc::Product::KnownProducts::ASM},
+      : ProductListener{Product::ASM, {Capability::ASM_CUSTOM_RULES}},
         cur_appsec_cfg_{cur_appsec_cfg} {}
 
-  void on_config_update(const rc::ParsedConfigKey &key,
-                        const std::string &content,
-                        std::vector<dd::ConfigMetadata> &) override {
+  void on_update(const ParsedConfigKey &key,
+                 const std::string &content) override {
     rapidjson::Document doc;
     rapidjson::ParseResult result = doc.Parse(content.c_str(), content.size());
     if (!result) {
@@ -649,17 +760,33 @@ class AsmUserConfigListener : public rc::ProductListener {
     cur_appsec_cfg_.user_config_add_config(std::move(new_config));
   }
 
-  void on_config_remove(const rc::ParsedConfigKey &key,
-                        std::vector<dd::ConfigMetadata> &) override {
+  void on_revert(const ParsedConfigKey &key) override {
     cur_appsec_cfg_.user_config_remove_config(key);
   }
 
-  rc::CapabilitiesSet capabilities() const override {
-    return rc::Capability::ASM_CUSTOM_RULES;
-  };
-
  private:
   CurrentAppSecConfig &cur_appsec_cfg_;
+};
+
+class ConfigurationEndListener : public rc::Listener {
+ public:
+  ConfigurationEndListener(std::function<void()> func)
+      : func_{std::move(func)} {}
+
+  rc::Products get_products() override { return {}; }
+
+  rc::Capabilities get_capabilities() override { return {}; }
+
+  dd::Optional<std::string> on_update(const Configuration &) override {
+    return {};
+  };
+
+  void on_revert(const Configuration &config) override {}
+
+  void on_post_process() override { func_(); }
+
+ private:
+  std::function<void()> func_;
 };
 
 class AppSecConfigService {
@@ -712,37 +839,73 @@ class AppSecConfigService {
     if (accept_cfg_update) {
       subscribe_rules_and_data(ddac);
 
-      ddac.rem_cfg_end_listeners.emplace_back([this] {
-        std::optional<dnsec::ddwaf_owned_map> maybe_upd =
-            current_config_.merged_update_config();
-        if (maybe_upd) {
-          auto &&upd = *maybe_upd;
-          dnsec::Library::update_ruleset(upd.get());
-        }
-      });
+      ddac.remote_configuration_listeners.emplace_back(
+          new ConfigurationEndListener([this] {
+            std::optional<dnsec::ddwaf_owned_map> maybe_upd =
+                current_config_.merged_update_config();
+            if (maybe_upd) {
+              auto &&upd = *maybe_upd;
+              dnsec::Library::update_ruleset(upd.get());
+            }
+          }));
     }
   }
 
  private:
   void subscribe_activation(datadog::tracing::DatadogAgentConfig &ddac) {
     // ASM_FEATURES
-    ddac.rem_cfg_listeners.emplace_back(new AsmFeaturesListener());
+    ddac.remote_configuration_listeners.emplace_back(new AsmFeaturesListener());
   }
 
   void subscribe_rules_and_data(datadog::tracing::DatadogAgentConfig &ddac) {
     // ASM_DD
-    ddac.rem_cfg_listeners.emplace_back(
+    ddac.remote_configuration_listeners.emplace_back(
         new AsmDDListener(current_config_, default_config_));
 
     // ASM_DATA
-    ddac.rem_cfg_listeners.emplace_back(
+    ddac.remote_configuration_listeners.emplace_back(
         new AsmDataListener(current_config_, *logger_));
 
     // ASM
-    ddac.rem_cfg_listeners.emplace_back(
+    ddac.remote_configuration_listeners.emplace_back(
         new AsmUserConfigListener(current_config_));
   }
 };
+
+template <typename SubMatch>
+StringView submatch_to_sv(const SubMatch &sub_match) {
+  return StringView{&*sub_match.first,
+                    static_cast<std::size_t>(sub_match.length())};
+}
+
+void ParsedConfigKey::parse_config_key() {
+  static std::regex const rgx{
+      "(?:datadog/(\\d+)|employee)/([^/]+)/([^/]+)/([^/]+)"};
+  std::smatch smatch;
+  if (!std::regex_match(key_, smatch, rgx)) {
+    throw std::invalid_argument("Invalid config key: " + key_);
+  }
+
+  if (key_[0] == 'd') {
+    source_ = "datadog";
+    auto [ptr, ec] =
+        std::from_chars(&*smatch[1].first, &*smatch[1].second, org_id_);
+    if (ec != std::errc{} || ptr != &*smatch[1].second) {
+      throw std::invalid_argument("Invalid org_id in config key " + key_ +
+                                  ": " +
+                                  std::string{submatch_to_sv(smatch[1])});
+    }
+  } else {
+    source_ = "employee";
+    org_id_ = 0;
+  }
+
+  StringView const product_sv{submatch_to_sv(smatch[2])};
+  product_ = rc::parse_product(product_sv);
+
+  config_id_ = submatch_to_sv(smatch[3]);
+  name_ = submatch_to_sv(smatch[4]);
+}
 
 }  // namespace
 
