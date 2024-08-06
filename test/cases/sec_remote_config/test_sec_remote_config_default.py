@@ -63,7 +63,7 @@ class TestSecRemoteConfig(case.TestCase):
                         "_type": "targets",
                         "expires": "2034-8-08T18:08:04Z",
                         "spec_version": "1.0.0",
-                        "version": int(time.time()),
+                        "version": version,
                         "custom": {
                             "agent_refresh_interval":
                             1,
@@ -73,7 +73,7 @@ class TestSecRemoteConfig(case.TestCase):
                         "targets": {
                             key: {
                                 "custom": {
-                                    "v": int(time.time())
+                                    "v": version
                                 },
                                 "length": len(content),
                                 "hashes": {
