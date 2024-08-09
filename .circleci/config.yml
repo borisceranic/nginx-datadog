@@ -304,7 +304,7 @@ workflows:
             waf:
             - 'OFF'
             arch:
-            - arm64
+            - arm
         name: build images for Ingress NGINX << matrix.nginx-controller-version >> with WAF << matrix.waf >> on << matrix.arch >>
         context:
           - nginx-datadog-dockerhub
