@@ -109,7 +109,7 @@ jobs:
       MAKE_JOB_COUNT: 8
       WAF: "<< parameters.waf >>"
       NGINX_VERSION: "<< parameters.nginx-version >>"
-  build_amd64_init_container:
+  build_init_container:
     parameters:
       nginx-controller-version:
         type: string
@@ -118,6 +118,8 @@ jobs:
         enum:
         - 'ON'
         - 'OFF'
+      arch:
+        type: string
     steps:
     - checkout
     - run: git submodule sync && git submodule update --init --recursive
@@ -160,6 +162,7 @@ jobs:
           docker push datadog/ingress-nginx-injection
     docker:
       - image: docker:25.0.5-git
+    resource_class: << parameters.arch >>.medium
   coverage:
     environment:
       DOCKER_BUILDKIT: 1
@@ -293,14 +296,16 @@ workflows:
             - 'ON'
             - 'OFF'
         name: build << matrix.nginx-version >> on arm64 WAF << matrix.waf >>
-    - build_amd64_init_container:
+    - build_init_container:
         matrix:
           parameters:
             nginx-controller-version:
             - 1.9.6
             waf:
             - 'OFF'
-        name: build images for Ingress NGINX << matrix.nginx-controller-version >> on amd64 WAF << matrix.waf >>
+            arch:
+            - arm64
+        name: build images for Ingress NGINX << matrix.nginx-controller-version >> with WAF << matrix.waf >> on << matrix.arch >>
         context:
           - nginx-datadog-dockerhub
     - coverage:
