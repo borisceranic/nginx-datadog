@@ -127,13 +127,13 @@ jobs:
         name: Build the init container
         command: |
           case $NGINX_CONTROLLER_VERSION in
-              "v1.11.1"|"v1.11.0"|"v1.10.3"|"v1.10.2")
+              "1.11.1"|"1.11.0"|"1.10.3"|"1.10.2")
                   NGINX_VERSION="1.25.5"
                   ;;
-              "v1.10.1"|"v1.10.0")
+              "1.10.1"|"1.10.0")
                   NGINX_VERSION="1.25.3"
                   ;;
-              "v1.9.6"|"v1.9.5"|"v1.9.4"|"v1.9.3"|"v1.9.1"|"v1.9.0"|"v1.8.4")
+              "1.9.6"|"1.9.5"|"1.9.4"|"1.9.3"|"1.9.1"|"1.9.0"|"1.8.4")
                   NGINX_VERSION="1.21.6"
                   ;;
               *)
@@ -297,7 +297,7 @@ workflows:
         matrix:
           parameters:
             nginx-controller-version:
-            - 1.8.4
+            - 1.9.6
             waf:
             - 'OFF'
         name: build images for Ingress NGINX << matrix.nginx-controller-version >> on amd64 WAF << matrix.waf >>

@@ -25,7 +25,7 @@ services:
     depends_on:
       - lib_inject
       - testagent
-    image: registry.k8s.io/ingress-nginx/controller:${NGINX_CONTROLLER_VERSION}
+    image: registry.k8s.io/ingress-nginx/controller:v${NGINX_CONTROLLER_VERSION}
     environment:
       - DD_TRACE_AGENT_URL=http://testagent:8126
       - DD_AGENT_HOST=testagent
