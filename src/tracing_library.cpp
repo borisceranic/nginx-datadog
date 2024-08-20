@@ -75,10 +75,11 @@ dd::Expected<dd::Tracer> TracingLibrary::make_tracer(
   }
 
 #ifdef WITH_WAF
-  bool appsec_fully_disabled = nginx_conf.appsec_enabled == 0;
+  const bool appsec_fully_disabled = (nginx_conf.appsec_enabled == 0);
   if (!appsec_fully_disabled) {
-    bool has_custom_ruleset = nginx_conf.appsec_ruleset_file.len > 0;
-    bool appsec_enabling_explicit = nginx_conf.appsec_enabled != NGX_CONF_UNSET;
+    const bool has_custom_ruleset = (nginx_conf.appsec_ruleset_file.len > 0);
+    const bool appsec_enabling_explicit =
+        (nginx_conf.appsec_enabled != NGX_CONF_UNSET);
     security::register_with_remote_cfg(
         config.agent,
         !has_custom_ruleset,         // no custom ruleset => ruleset via rem cfg

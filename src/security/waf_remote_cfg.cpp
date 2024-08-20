@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <charconv>
 #include <datadog/json.hpp>
+#include <initializer_list>
 #include <optional>
 #include <ostream>
 #include <regex>
@@ -564,49 +565,60 @@ class JsonParsedConfig {
   nlohmann::json json_;
 };
 
+template <typename Self>
 class ProductListener : public rc::Listener {
  protected:
-  ProductListener(Product product,
-                  std::initializer_list<Capability> capabilities)
-      : product_{product} {
-    for (auto c : capabilities) {
-      capabilities_ |= c;
-    }
-  }
+  ProductListener(dd::Logger &logger) : logger_{logger} {}
 
-  rc::Products get_products() /* const */ override final { return product_; }
+  rc::Products get_products() /* const */ override final {
+    return Self::kProduct;
+  }
 
   rc::Capabilities get_capabilities() /* const */ override final {
-    return capabilities_;
+    rc::Capabilities caps{};
+    for (auto c : Self::kCapabilities) {
+      caps |= c;
+    }
+    return caps;
   }
-
-  virtual void on_update(const ParsedConfigKey &key,
-                         const std::string &content) = 0;
 
   dd::Optional<std::string> on_update(
       const Configuration &config) override final {
     try {
-      on_update(ParsedConfigKey{config.path}, config.content);
+      static_cast<Self *>(this)->on_update_impl(ParsedConfigKey{config.path},
+                                                config.content);
+      logger_.log_debug([&key = config.path](std::ostream &oss) {
+        oss << "successfully applied config: " << key;
+      });
       return {};
     } catch (const std::exception &e) {
+      logger_.log_error([&key = config.path, &e](std::ostream &oss) {
+        oss << "failed to update config: " << key << ": " << e.what();
+      });
       return e.what();
     }
   };
 
-  virtual void on_revert(const ParsedConfigKey &key) = 0;
-
   void on_revert(const Configuration &config) override final {
-    on_revert(ParsedConfigKey{config.path});
+    try {
+      static_cast<Self *>(this)->on_revert_impl(ParsedConfigKey{config.path});
+      logger_.log_debug([&key = config.path](std::ostream &oss) {
+        oss << "successfully reverted config: " << key;
+      });
+    } catch (const std::exception &e) {
+      logger_.log_error([&key = config.path, &e](std::ostream &oss) {
+        oss << "failed to revert config: " << key << ": " << e.what();
+      });
+    }
   }
 
   void on_post_process() override {}
 
- private:
-  rc::Products product_;
-  rc::Capabilities capabilities_{};
+ protected:
+  dd::Logger &logger_;
 };
 
-class AsmFeaturesListener : public ProductListener {
+class AsmFeaturesListener : public ProductListener<AsmFeaturesListener> {
   class AppSecFeatures : public JsonParsedConfig {
    public:
     using JsonParsedConfig::JsonParsedConfig;
@@ -621,11 +633,12 @@ class AsmFeaturesListener : public ProductListener {
   };
 
  public:
-  AsmFeaturesListener()
-      : ProductListener{Product::ASM_FEATURES, {Capability::ASM_ACTIVATION}} {}
+  static constexpr inline auto kProduct = Product::ASM_FEATURES;
+  static constexpr inline auto kCapabilities = {Capability::ASM_ACTIVATION};
 
-  void on_update(const ParsedConfigKey &key,
-                 const std::string &content) override {
+  AsmFeaturesListener(dd::Logger &logger) : ProductListener{logger} {}
+
+  void on_update_impl(const ParsedConfigKey &key, const std::string &content) {
     if (key.config_id() != "asm_features_activation"sv) {
       return;
     }
@@ -640,26 +653,28 @@ class AsmFeaturesListener : public ProductListener {
     dnsec::Library::set_active(new_state);
   };
 
-  void on_revert(const ParsedConfigKey &key) override {
-    return on_update(key, std::string{"{}"});
+  void on_revert_impl(const ParsedConfigKey &key) {
+    return on_update_impl(key, std::string{"{}"});
   };
 };
 
-class AsmDDListener : public ProductListener {
+class AsmDDListener : public ProductListener<AsmDDListener> {
  public:
+  static constexpr inline auto kProduct = Product::ASM_DD;
+  static constexpr inline auto kCapabilities = {
+      Capability::ASM_DD_RULES,
+      Capability::ASM_IP_BLOCKING,
+      Capability::ASM_REQUEST_BLOCKING,
+  };
+
   AsmDDListener(CurrentAppSecConfig &cur_appsec_cfg,
-                std::shared_ptr<dnsec::ddwaf_owned_map> default_config)
-      : ProductListener{Product::ASM_DD,
-                        {
-                            Capability::ASM_DD_RULES,
-                            Capability::ASM_IP_BLOCKING,
-                            Capability::ASM_REQUEST_BLOCKING,
-                        }},
+                std::shared_ptr<dnsec::ddwaf_owned_map> default_config,
+                dd::Logger &logger)
+      : ProductListener{logger},
         cur_appsec_cfg_{cur_appsec_cfg},
         default_config_{default_config} {}
 
-  void on_update(const ParsedConfigKey &key,
-                 const std::string &content) override {
+  void on_update_impl(const ParsedConfigKey &key, const std::string &content) {
     // convert content to rapidjson::Document:
     rapidjson::Document doc;
     rapidjson::ParseResult result = doc.Parse(content.c_str(), content.size());
@@ -676,7 +691,7 @@ class AsmDDListener : public ProductListener {
     cur_appsec_cfg_.set_dd_config(std::move(new_config));
   }
 
-  void on_revert(const ParsedConfigKey &key) override {
+  void on_revert_impl(const ParsedConfigKey &key) {
     cur_appsec_cfg_.set_dd_config(default_config_);
   }
 
@@ -685,16 +700,16 @@ class AsmDDListener : public ProductListener {
   std::shared_ptr<dnsec::ddwaf_owned_map> default_config_;
 };
 
-class AsmDataListener : public ProductListener {
+class AsmDataListener : public ProductListener<AsmDataListener> {
  public:
+  static constexpr inline auto kProduct = Product::ASM_DATA;
+  static constexpr inline std::initializer_list<Capability> kCapabilities = {};
+
   AsmDataListener(CurrentAppSecConfig &cur_appsec_cfg,
                   datadog::tracing::Logger &logger)
-      : ProductListener{Product::ASM_DATA, {}},
-        cur_appsec_cfg_{cur_appsec_cfg},
-        logger_{logger} {}
+      : ProductListener{logger}, cur_appsec_cfg_{cur_appsec_cfg} {}
 
-  void on_update(const ParsedConfigKey &key,
-                 const std::string &content) override {
+  void on_update_impl(const ParsedConfigKey &key, const std::string &content) {
     rapidjson::Document doc;
     rapidjson::ParseResult result = doc.Parse(content.c_str(), content.size());
     if (!result) {
@@ -731,23 +746,23 @@ class AsmDataListener : public ProductListener {
     }
   }
 
-  void on_revert(const ParsedConfigKey &key) override {
+  void on_revert_impl(const ParsedConfigKey &key) {
     cur_appsec_cfg_.asm_data_remove_config(key);
   }
 
  private:
   CurrentAppSecConfig &cur_appsec_cfg_;
-  datadog::tracing::Logger &logger_;
 };
 
-class AsmUserConfigListener : public ProductListener {
+class AsmUserConfigListener : public ProductListener<AsmUserConfigListener> {
  public:
-  AsmUserConfigListener(CurrentAppSecConfig &cur_appsec_cfg)
-      : ProductListener{Product::ASM, {Capability::ASM_CUSTOM_RULES}},
-        cur_appsec_cfg_{cur_appsec_cfg} {}
+  static constexpr inline auto kProduct = Product::ASM;
+  static constexpr inline auto kCapabilities = {Capability::ASM_CUSTOM_RULES};
 
-  void on_update(const ParsedConfigKey &key,
-                 const std::string &content) override {
+  AsmUserConfigListener(CurrentAppSecConfig &cur_appsec_cfg, dd::Logger &logger)
+      : ProductListener{logger}, cur_appsec_cfg_{cur_appsec_cfg} {}
+
+  void on_update_impl(const ParsedConfigKey &key, const std::string &content) {
     rapidjson::Document doc;
     rapidjson::ParseResult result = doc.Parse(content.c_str(), content.size());
     if (!result) {
@@ -760,7 +775,7 @@ class AsmUserConfigListener : public ProductListener {
     cur_appsec_cfg_.user_config_add_config(std::move(new_config));
   }
 
-  void on_revert(const ParsedConfigKey &key) override {
+  void on_revert_impl(const ParsedConfigKey &key) {
     cur_appsec_cfg_.user_config_remove_config(key);
   }
 
@@ -854,13 +869,14 @@ class AppSecConfigService {
  private:
   void subscribe_activation(datadog::tracing::DatadogAgentConfig &ddac) {
     // ASM_FEATURES
-    ddac.remote_configuration_listeners.emplace_back(new AsmFeaturesListener());
+    ddac.remote_configuration_listeners.emplace_back(
+        new AsmFeaturesListener(*logger_));
   }
 
   void subscribe_rules_and_data(datadog::tracing::DatadogAgentConfig &ddac) {
     // ASM_DD
     ddac.remote_configuration_listeners.emplace_back(
-        new AsmDDListener(current_config_, default_config_));
+        new AsmDDListener(current_config_, default_config_, *logger_));
 
     // ASM_DATA
     ddac.remote_configuration_listeners.emplace_back(
@@ -868,7 +884,7 @@ class AppSecConfigService {
 
     // ASM
     ddac.remote_configuration_listeners.emplace_back(
-        new AsmUserConfigListener(current_config_));
+        new AsmUserConfigListener(current_config_, *logger_));
   }
 };
 
