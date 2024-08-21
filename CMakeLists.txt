@@ -148,7 +148,11 @@ target_include_directories(ngx_http_datadog_module
     src/
 )
 
-target_link_libraries(ngx_http_datadog_module dd_trace_cpp-static nginx_module)
+target_link_libraries(ngx_http_datadog_module
+  dd_trace_cpp-static
+  nginx_module
+  nlohmann_json::nlohmann_json # comes from dd-trace-cpp
+)
 
 if(NGINX_DATADOG_ASM_ENABLED)
   target_link_libraries(ngx_http_datadog_module rapidjson libddwaf_objects)

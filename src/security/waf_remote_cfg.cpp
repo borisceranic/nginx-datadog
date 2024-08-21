@@ -11,10 +11,10 @@
 
 #include <algorithm>
 #include <charconv>
-#include <datadog/json.hpp>
 #include <initializer_list>
 #include <optional>
 #include <ostream>
+#include <nlohmann/json.hpp>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
