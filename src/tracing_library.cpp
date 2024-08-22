@@ -10,8 +10,8 @@
 
 #include <algorithm>
 #include <cassert>
-#include <nlohmann/json.hpp>
 #include <iterator>
+#include <nlohmann/json.hpp>
 #include <ostream>
 
 #include "datadog_conf.h"

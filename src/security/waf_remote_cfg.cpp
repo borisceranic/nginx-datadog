@@ -12,9 +12,9 @@
 #include <algorithm>
 #include <charconv>
 #include <initializer_list>
+#include <nlohmann/json.hpp>
 #include <optional>
 #include <ostream>
-#include <nlohmann/json.hpp>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
@@ -783,12 +783,13 @@ class AsmUserConfigListener : public ProductListener<AsmUserConfigListener> {
   CurrentAppSecConfig &cur_appsec_cfg_;
 };
 
+template <Product... Ps>
 class ConfigurationEndListener : public rc::Listener {
  public:
   ConfigurationEndListener(std::function<void()> func)
       : func_{std::move(func)} {}
 
-  rc::Products get_products() override { return {}; }
+  rc::Products get_products() override { return (Ps | ... | 0); }
 
   rc::Capabilities get_capabilities() override { return {}; }
 
@@ -855,7 +856,8 @@ class AppSecConfigService {
       subscribe_rules_and_data(ddac);
 
       ddac.remote_configuration_listeners.emplace_back(
-          new ConfigurationEndListener([this] {
+          new ConfigurationEndListener<Product::ASM, Product::ASM_DATA,
+                                       Product::ASM_DD>([this] {
             std::optional<dnsec::ddwaf_owned_map> maybe_upd =
                 current_config_.merged_update_config();
             if (maybe_upd) {
