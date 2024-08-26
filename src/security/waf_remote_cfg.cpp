@@ -23,9 +23,11 @@
 #include "ddwaf_memres.h"
 #include "ddwaf_obj.h"
 #include "library.h"
+#include "ngx_logger.h"
 
 namespace rc = datadog::remote_config;
 namespace dnsec = datadog::nginx::security;
+namespace dn = datadog::nginx;
 using namespace std::literals;
 using dd::StringView;
 using Product = rc::product::Flag;
@@ -568,7 +570,7 @@ class JsonParsedConfig {
 template <typename Self>
 class ProductListener : public rc::Listener {
  protected:
-  ProductListener(dd::Logger &logger) : logger_{logger} {}
+  ProductListener(dn::NgxLogger &logger) : logger_{logger} {}
 
   rc::Products get_products() /* const */ override final {
     return Self::kProduct;
@@ -615,7 +617,7 @@ class ProductListener : public rc::Listener {
   void on_post_process() override {}
 
  protected:
-  dd::Logger &logger_;
+  dn::NgxLogger &logger_;
 };
 
 class AsmFeaturesListener : public ProductListener<AsmFeaturesListener> {
@@ -636,7 +638,7 @@ class AsmFeaturesListener : public ProductListener<AsmFeaturesListener> {
   static constexpr inline auto kProduct = Product::ASM_FEATURES;
   static constexpr inline auto kCapabilities = {Capability::ASM_ACTIVATION};
 
-  AsmFeaturesListener(dd::Logger &logger) : ProductListener{logger} {}
+  AsmFeaturesListener(dn::NgxLogger &logger) : ProductListener{logger} {}
 
   void on_update_impl(const ParsedConfigKey &key, const std::string &content) {
     if (key.config_id() != "asm_features_activation"sv) {
@@ -669,7 +671,7 @@ class AsmDDListener : public ProductListener<AsmDDListener> {
 
   AsmDDListener(CurrentAppSecConfig &cur_appsec_cfg,
                 std::shared_ptr<dnsec::ddwaf_owned_map> default_config,
-                dd::Logger &logger)
+                dn::NgxLogger &logger)
       : ProductListener{logger},
         cur_appsec_cfg_{cur_appsec_cfg},
         default_config_{default_config} {}
@@ -705,8 +707,7 @@ class AsmDataListener : public ProductListener<AsmDataListener> {
   static constexpr inline auto kProduct = Product::ASM_DATA;
   static constexpr inline std::initializer_list<Capability> kCapabilities = {};
 
-  AsmDataListener(CurrentAppSecConfig &cur_appsec_cfg,
-                  datadog::tracing::Logger &logger)
+  AsmDataListener(CurrentAppSecConfig &cur_appsec_cfg, dn::NgxLogger &logger)
       : ProductListener{logger}, cur_appsec_cfg_{cur_appsec_cfg} {}
 
   void on_update_impl(const ParsedConfigKey &key, const std::string &content) {
@@ -759,7 +760,8 @@ class AsmUserConfigListener : public ProductListener<AsmUserConfigListener> {
   static constexpr inline auto kProduct = Product::ASM;
   static constexpr inline auto kCapabilities = {Capability::ASM_CUSTOM_RULES};
 
-  AsmUserConfigListener(CurrentAppSecConfig &cur_appsec_cfg, dd::Logger &logger)
+  AsmUserConfigListener(CurrentAppSecConfig &cur_appsec_cfg,
+                        dn::NgxLogger &logger)
       : ProductListener{logger}, cur_appsec_cfg_{cur_appsec_cfg} {}
 
   void on_update_impl(const ParsedConfigKey &key, const std::string &content) {
@@ -808,12 +810,12 @@ class ConfigurationEndListener : public rc::Listener {
 class AppSecConfigService {
   std::shared_ptr<dnsec::ddwaf_owned_map> default_config_;
   CurrentAppSecConfig current_config_;
-  std::shared_ptr<datadog::tracing::Logger> logger_;
+  std::shared_ptr<dn::NgxLogger> logger_;
 
   static inline std::unique_ptr<AppSecConfigService> instance_;  // NOLINT
 
   AppSecConfigService(dnsec::ddwaf_owned_map default_config,
-                      std::shared_ptr<datadog::tracing::Logger> logger)
+                      std::shared_ptr<datadog::nginx::NgxLogger> logger)
       : default_config_{std::make_shared<dnsec::ddwaf_owned_map>(
             std::move(default_config))},
         logger_{std::move(logger)} {
@@ -828,7 +830,7 @@ class AppSecConfigService {
   ~AppSecConfigService() = default;
 
   static void initialize(dnsec::ddwaf_owned_map default_config,
-                         std::shared_ptr<datadog::tracing::Logger> logger) {
+                         std::shared_ptr<datadog::nginx::NgxLogger> logger) {
     if (instance_) {
       throw std::logic_error{"AppSecConfigService already initialized"};
     }
@@ -929,8 +931,9 @@ void ParsedConfigKey::parse_config_key() {
 
 namespace datadog::nginx::security {
 
-void register_default_config(ddwaf_owned_map default_config,
-                             std::shared_ptr<tracing::Logger> logger) {
+void register_default_config(
+    ddwaf_owned_map default_config,
+    std::shared_ptr<datadog::nginx::NgxLogger> logger) {
   AppSecConfigService::initialize(std::move(default_config), std::move(logger));
 }
 

@@ -615,7 +615,9 @@ static ngx_int_t datadog_init_worker(ngx_cycle_t *cycle) noexcept try {
   ngx_log_error(NGX_LOG_INFO, cycle->log, 0, "- tracing: dd-trace-cpp@%s",
                 datadog_version_tracer);
 
-  std::shared_ptr<dd::Logger> logger = std::make_shared<NgxLogger>();
+  std::shared_ptr<datadog::nginx::NgxLogger> logger =
+      std::make_shared<NgxLogger>();
+
 #ifdef WITH_WAF
   ngx_log_error(NGX_LOG_INFO, cycle->log, 0,
                 "- appsec: libddwaf@%s, waf_rules@%s", datadog_semver_libddwaf,
