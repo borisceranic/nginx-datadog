@@ -1,6 +1,7 @@
 #include "context.h"
 
 #include <ngx_core.h>
+#include <ngx_event_posted.h>
 #include <ngx_http_core_module.h>
 #include <ngx_log.h>
 
@@ -21,6 +22,7 @@
 #include "../ngx_http_datadog_module.h"
 #include "../tracing_library.h"
 #include "blocking.h"
+#include "body_parsing.h"
 #include "collection.h"
 #include "ddwaf_obj.h"
 #include "header_tags.h"
@@ -165,7 +167,7 @@ auto catch_exceptions(std::string_view name, const ngx_http_request_t &req,
 namespace datadog::nginx::security {
 
 Context::Context(std::shared_ptr<OwnedDdwafHandle> handle)
-    : waf_handle_{std::move(handle)}, stage_{new std::atomic<stage>{}} {
+    : stage_{new std::atomic<stage>{}}, waf_handle_{std::move(handle)} {
   if (!waf_handle_) {
     return;
   }
@@ -190,8 +192,8 @@ class PolTaskCtx {
       : req_{req},
         ctx_{ctx},
         span_{span},
-        prev_read_evt_handler_(req.read_event_handler),
-        prev_write_evt_handler_(req.write_event_handler) {}
+        prev_read_evt_handler_{req.read_event_handler},
+        prev_write_evt_handler_{req.write_event_handler} {}
 
  public:
   // the returned reference is request pool allocated and must have its
@@ -345,7 +347,8 @@ class Pol1stWafCtx : public PolTaskCtx<Pol1stWafCtx> {
 
   void complete() noexcept {
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, req_.connection->log, 0,
-                   "completion handler of waf start task");
+                   "completion handler of waf start task: start");
+
     bool const ran = ran_on_thread_.load(std::memory_order_acquire);
     if (ran && block_spec_) {
       span_.set_tag("appsec.blocked"sv, "true"sv);
@@ -363,6 +366,9 @@ class Pol1stWafCtx : public PolTaskCtx<Pol1stWafCtx> {
       req_.phase_handler++;  // move past us
       ngx_http_core_run_phases(&req_);
     }
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, req_.connection->log, 0,
+                   "completion handler of waf start task: finish");
   }
 
   friend PolTaskCtx;
@@ -625,6 +631,15 @@ std::optional<BlockSpecification> Context::run_waf_start(
   return block_spec;
 }
 
+ngx_int_t Context::request_body_filter(ngx_http_request_t &request,
+                                       ngx_chain_t *chain,
+                                       dd::Span &span) noexcept {
+  return catch_exceptions(
+      "request_body_filter"sv, request,
+      [&]() { return Context::do_request_body_filter(request, chain, span); },
+      static_cast<ngx_int_t>(NGX_ERROR));
+}
+
 ngx_int_t Context::output_body_filter(ngx_http_request_t &request,
                                       ngx_chain_t *chain,
                                       dd::Span &span) noexcept {
@@ -633,6 +648,47 @@ ngx_int_t Context::output_body_filter(ngx_http_request_t &request,
       [&]() { return Context::do_output_body_filter(request, chain, span); },
       static_cast<ngx_int_t>(NGX_ERROR));
 }
+
+class PolReqBodyWafCtx : public PolTaskCtx<PolReqBodyWafCtx> {
+  using PolTaskCtx::PolTaskCtx;
+
+  std::optional<BlockSpecification> do_handle(ngx_log_t &log) {
+    return ctx_.run_waf_req_post(req_, span_);
+  }
+
+  void complete() noexcept {
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, req_.connection->log, 0,
+                   "completion handler of waf req post task: start");
+    bool const ran = ran_on_thread_.load(std::memory_order_acquire);
+
+    if (ran && block_spec_) {
+      span_.set_tag("appsec.blocked"sv, "true"sv);
+      ctx_.waf_req_post_done(req_, true);
+
+      auto *service = BlockingService::get_instance();
+      assert(service != nullptr);
+      try {
+        service->block(*block_spec_, req_);
+      } catch (const std::exception &e) {
+        ngx_log_error(NGX_LOG_ERR, req_.connection->log, 0,
+                      "failed to block request: %s", e.what());
+        ngx_http_finalize_request(&req_, NGX_DONE);
+      }
+    } else {
+      ctx_.waf_req_post_done(req_, false);
+      ngx_log_debug(NGX_LOG_DEBUG_HTTP, req_.connection->log, 0,
+                    "not blocking after request body waf run; "
+                    "triggering read event on connection");
+      ngx_post_event(req_.connection->read, &ngx_posted_events);
+    }
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, req_.connection->log, 0,
+                   "completion handler of waf req post task: finish");
+  }
+
+  friend PolTaskCtx;
+};
+
 
 class PolFinalWafCtx : public PolTaskCtx<PolFinalWafCtx> {
   using PolTaskCtx::PolTaskCtx;
@@ -643,16 +699,136 @@ class PolFinalWafCtx : public PolTaskCtx<PolFinalWafCtx> {
 
   void complete() noexcept {
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, req_.connection->log, 0,
-                   "completion handler of waf task");
+                   "completion of final waf task");
   }
 
   friend PolTaskCtx;
 };
 
+ngx_int_t Context::do_request_body_filter(ngx_http_request_t &request,
+                                         ngx_chain_t *in, dd::Span &span) {
+
+  auto st = stage_->load(std::memory_order_acquire);
+
+  if (st == stage::AFTER_BEGIN_WAF) {
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, request.connection->log, 0,
+                  "first filter call, req refcount=%d", request.main->count);
+    // buffer the request body during reading
+    // https://github.com/nginx/nginx/commit/67d160bf25e02ba6679bb6c3b9cbdfeb29b759de
+    // https://nginx.org/en/docs/dev/development_guide.html#http_request_body_filters
+    request.request_body->filter_need_buffering = true;
+
+
+    if (ngx_chain_add_copy(request.pool, &filter_ctx_.out, in) != NGX_OK) {
+      return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    if (in->buf->pos ==
+        request.header_in->pos - (in->buf->last - in->buf->pos)) {
+      // preread call by ngx_http_read_client_request_body.
+      // read and write handlers were not set yet, so don't launch the
+      // waf now. We'll do it on the next call.
+      ngx_log_debug(NGX_LOG_DEBUG_HTTP, request.connection->log, 0,
+                    "1st preread call, no waf task submission yet");
+      st = transition_to_stage(stage::COLLECTING_ON_REQ_DATA_PREREAD);
+    } else {
+      st = transition_to_stage(stage::COLLECTING_ON_REQ_DATA);
+    }
+
+    // continues below
+  } else if (st == stage::COLLECTING_ON_REQ_DATA_PREREAD) {
+    if (ngx_chain_add_copy(request.pool, &filter_ctx_.out, in) != NGX_OK) {
+      return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    st = transition_to_stage(stage::COLLECTING_ON_REQ_DATA);
+
+    // continues below
+  } else if (st == stage::COLLECTING_ON_REQ_DATA) {
+    if (ngx_chain_add_copy(request.pool, &filter_ctx_.out, in) != NGX_OK) {
+      return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    // continues below
+  } else if (st == stage::AFTER_ON_REQ_WAF ||
+             st == stage::AFTER_ON_REQ_WAF_BLOCK) {
+
+    if (filter_ctx_.out) { // first call after WAF ended
+      ngx_log_debug(NGX_LOG_DEBUG_HTTP, request.connection->log, 0,
+                    "first filter call after WAF ended, req refcount=%d",
+                    request.main->count);
+      if (ngx_chain_add_copy(request.pool, &filter_ctx_.out, in) != NGX_OK) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+      }
+
+      // pass saved buffers downstream
+      auto rc = ngx_http_next_request_body_filter(&request, filter_ctx_.out);
+
+      for (auto *cl = filter_ctx_.out; cl;) {
+        auto *ln = cl;
+        cl = cl->next;
+        ngx_free_chain(request.pool, ln);
+      }
+      filter_ctx_.out = nullptr;
+
+      return rc;
+    }
+
+    return ngx_http_next_request_body_filter(&request, in);
+  } else if (st == stage::SUSPENDED_ON_REQ_WAF) {
+    ngx_log_error(NGX_LOG_NOTICE, request.connection->log, 0,
+                  "unexpected filter call in stage SUSPENDED_ON_REQ_WAF");
+    if (ngx_chain_add_copy(request.pool, &filter_ctx_.out, in) != NGX_OK) {
+      return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+  } else {
+    ngx_log_error(NGX_LOG_NOTICE, request.connection->log, 0,
+                  "unexpected filter call in stage %d", st);
+    return ngx_http_next_request_body_filter(&request, in);
+  }
+
+  if (st == stage::COLLECTING_ON_REQ_DATA ||
+      st == stage::COLLECTING_ON_REQ_DATA_PREREAD) {
+
+    // save buffers
+    for (ngx_chain_t *chain = in; chain;) {
+      filter_ctx_.out_total += ngx_buf_size(chain->buf);
+      auto *next_chain = chain->next;
+      if (next_chain == nullptr && chain->buf->last_buf) {
+        filter_ctx_.found_last |= true;
+        break;
+      }
+      chain = next_chain;
+    }
+
+    if (st == stage::COLLECTING_ON_REQ_DATA &&
+        (filter_ctx_.found_last || filter_ctx_.out_total >= kMaxFilterData)) {
+
+      // TODO skip if request body is empty
+      PolReqBodyWafCtx &task_ctx =
+          PolReqBodyWafCtx::create(request, *this, span);
+
+      transition_to_stage(stage::SUSPENDED_ON_REQ_WAF);
+
+      auto *conf = static_cast<datadog_loc_conf_t *>(
+          ngx_http_get_module_loc_conf(&request, ngx_http_datadog_module));
+
+      if (task_ctx.submit(conf->waf_pool)) {
+        ngx_log_debug(NGX_LOG_DEBUG_HTTP, request.connection->log, 0,
+                      "posted request body waf req post task");
+      } else {
+        transition_to_stage(stage::AFTER_ON_REQ_WAF);
+      }
+    }
+  }
+
+  return ngx_http_next_request_body_filter(&request, nullptr);
+}
+
 ngx_int_t Context::do_output_body_filter(ngx_http_request_t &request,
                                          ngx_chain_t *chain, dd::Span &span) {
   auto st = stage_->load(std::memory_order_acquire);
-  if (st != stage::AFTER_BEGIN_WAF) {
+  if (st != stage::AFTER_BEGIN_WAF && st != stage::AFTER_ON_REQ_WAF) {
     return ngx_http_next_output_body_filter(&request, chain);
   }
 
@@ -661,7 +837,7 @@ ngx_int_t Context::do_output_body_filter(ngx_http_request_t &request,
   auto *conf = static_cast<datadog_loc_conf_t *>(
       ngx_http_get_module_loc_conf(&request, ngx_http_datadog_module));
 
-  stage_->store(stage::BEFORE_RUN_WAF_END, std::memory_order_release);
+  transition_to_stage(stage::BEFORE_RUN_WAF_END);
 
   if (task_ctx.submit(conf->waf_pool)) {
     ngx_log_debug(NGX_LOG_DEBUG_HTTP, request.connection->log, 0,
@@ -688,6 +864,48 @@ ngx_int_t Context::do_output_body_filter(ngx_http_request_t &request,
   return ngx_http_next_output_body_filter(&request, chain);
 }
 
+std::optional<BlockSpecification> Context::run_waf_req_post(
+    ngx_http_request_t &request, dd::Span &span) {
+  ddwaf_obj data =
+      parse_body(request, *filter_ctx_.out, filter_ctx_.out_total, memres_);
+
+  ddwaf_obj input;
+  ddwaf_map_obj &input_map = input.make_map(1, memres_);
+  ddwaf_obj &entry = input_map.at_unchecked(0);
+  entry.set_key("server.request.body"sv);
+  entry.shallow_copy_val_from(data);
+
+  ddwaf_result result;
+  DDWAF_RET_CODE const code = ddwaf_run(ctx_.resource, &input, nullptr,
+                                        &result, Library::waf_timeout());
+  if (code == DDWAF_MATCH) {
+    results_.emplace_back(result);
+  } else {
+    ddwaf_result_free(&result);
+  }
+
+  std::optional<BlockSpecification> block_spec;
+  ddwaf_map_obj actions_arr{result.actions};
+  if (code == DDWAF_MATCH && !actions_arr.empty()) {
+    ActionsResult actions_res{actions_arr};
+    block_spec = resolve_block_spec(actions_arr, *request.connection->log);
+  }
+
+  return block_spec;
+}
+
+void Context::waf_req_post_done(ngx_http_request_t &request, bool blocked) {
+  bool res = checked_transition_to_stage(
+      stage::SUSPENDED_ON_REQ_WAF,
+      blocked ? stage::AFTER_ON_REQ_WAF_BLOCK : stage::AFTER_ON_REQ_WAF);
+
+  if (!res) {
+    ngx_log_error(NGX_LOG_ERR, request.connection->log, 0,
+                  "call to waf_req_post_done without current stage being "
+                  "SUSPENDED_ON_REQ_WAF");
+  }
+}
+
 std::optional<BlockSpecification> Context::run_waf_end(
     ngx_http_request_t &request, dd::Span &span) {
   auto st = stage_->load(std::memory_order_acquire);
@@ -706,7 +924,7 @@ std::optional<BlockSpecification> Context::run_waf_end(
     ddwaf_result_free(&result);
   }
 
-  stage_->store(stage::AFTER_RUN_WAF_END, std::memory_order_release);
+  transition_to_stage(stage::AFTER_RUN_WAF_END);
 
   return std::nullopt;  // we don't support blocking in the final waf run
 }

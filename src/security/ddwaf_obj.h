@@ -123,6 +123,11 @@ struct __attribute__((__may_alias__)) ddwaf_obj : ddwaf_object {
     return make_string({s, sv.size()});
   }
 
+  ddwaf_str_obj &make_string(std::size_t size, DdwafMemres &memres) {
+    char *s = memres.allocate_string(size);
+    return make_string({s, size});
+  }
+
   template <typename C>
   ddwaf_str_obj &make_string(C *) = delete;
 
@@ -220,6 +225,7 @@ struct __attribute__((__may_alias__)) ddwaf_str_obj : ddwaf_obj {
   ddwaf_str_obj(const ddwaf_arr_obj &) = delete;
 
   std::string_view value() const { return {stringValue, nbEntries}; }
+  char *buffer() { return const_cast<char *>(stringValue); }
 };
 
 struct __attribute__((__may_alias__)) ddwaf_arr_obj : ddwaf_obj {

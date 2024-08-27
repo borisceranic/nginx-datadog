@@ -116,6 +116,7 @@ if(NGINX_DATADOG_ASM_ENABLED)
   target_sources(ngx_http_datadog_module
     PRIVATE
     src/security/blocking.cpp
+    src/security/body_parsing.cpp
     src/security/client_ip.cpp
     src/security/collection.cpp
     src/security/context.cpp
