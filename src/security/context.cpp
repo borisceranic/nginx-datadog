@@ -689,7 +689,6 @@ class PolReqBodyWafCtx : public PolTaskCtx<PolReqBodyWafCtx> {
   friend PolTaskCtx;
 };
 
-
 class PolFinalWafCtx : public PolTaskCtx<PolFinalWafCtx> {
   using PolTaskCtx::PolTaskCtx;
 
@@ -706,8 +705,7 @@ class PolFinalWafCtx : public PolTaskCtx<PolFinalWafCtx> {
 };
 
 ngx_int_t Context::do_request_body_filter(ngx_http_request_t &request,
-                                         ngx_chain_t *in, dd::Span &span) {
-
+                                          ngx_chain_t *in, dd::Span &span) {
   auto st = stage_->load(std::memory_order_acquire);
 
   if (st == stage::AFTER_BEGIN_WAF) {
@@ -717,7 +715,6 @@ ngx_int_t Context::do_request_body_filter(ngx_http_request_t &request,
     // https://github.com/nginx/nginx/commit/67d160bf25e02ba6679bb6c3b9cbdfeb29b759de
     // https://nginx.org/en/docs/dev/development_guide.html#http_request_body_filters
     request.request_body->filter_need_buffering = true;
-
 
     if (ngx_chain_add_copy(request.pool, &filter_ctx_.out, in) != NGX_OK) {
       return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -752,8 +749,7 @@ ngx_int_t Context::do_request_body_filter(ngx_http_request_t &request,
     // continues below
   } else if (st == stage::AFTER_ON_REQ_WAF ||
              st == stage::AFTER_ON_REQ_WAF_BLOCK) {
-
-    if (filter_ctx_.out) { // first call after WAF ended
+    if (filter_ctx_.out) {  // first call after WAF ended
       ngx_log_debug(NGX_LOG_DEBUG_HTTP, request.connection->log, 0,
                     "first filter call after WAF ended, req refcount=%d",
                     request.main->count);
@@ -789,7 +785,6 @@ ngx_int_t Context::do_request_body_filter(ngx_http_request_t &request,
 
   if (st == stage::COLLECTING_ON_REQ_DATA ||
       st == stage::COLLECTING_ON_REQ_DATA_PREREAD) {
-
     // save buffers
     for (ngx_chain_t *chain = in; chain;) {
       filter_ctx_.out_total += ngx_buf_size(chain->buf);
@@ -803,7 +798,6 @@ ngx_int_t Context::do_request_body_filter(ngx_http_request_t &request,
 
     if (st == stage::COLLECTING_ON_REQ_DATA &&
         (filter_ctx_.found_last || filter_ctx_.out_total >= kMaxFilterData)) {
-
       // TODO skip if request body is empty
       PolReqBodyWafCtx &task_ctx =
           PolReqBodyWafCtx::create(request, *this, span);
@@ -866,18 +860,23 @@ ngx_int_t Context::do_output_body_filter(ngx_http_request_t &request,
 
 std::optional<BlockSpecification> Context::run_waf_req_post(
     ngx_http_request_t &request, dd::Span &span) {
-  ddwaf_obj data =
-      parse_body(request, *filter_ctx_.out, filter_ctx_.out_total, memres_);
-
   ddwaf_obj input;
   ddwaf_map_obj &input_map = input.make_map(1, memres_);
   ddwaf_obj &entry = input_map.at_unchecked(0);
   entry.set_key("server.request.body"sv);
-  entry.shallow_copy_val_from(data);
+
+  bool success = parse_body(entry, request, *filter_ctx_.out,
+                            filter_ctx_.out_total, memres_);
+
+  if (!success) {
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, request.connection->log, 0,
+                   "failed to parse request body for WAF");
+    return std::nullopt;
+  }
 
   ddwaf_result result;
-  DDWAF_RET_CODE const code = ddwaf_run(ctx_.resource, &input, nullptr,
-                                        &result, Library::waf_timeout());
+  DDWAF_RET_CODE const code = ddwaf_run(ctx_.resource, &input, nullptr, &result,
+                                        Library::waf_timeout());
   if (code == DDWAF_MATCH) {
     results_.emplace_back(result);
   } else {

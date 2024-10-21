@@ -53,6 +53,11 @@ class TestSecAddresses(case.TestCase):
         self.orch.send_nginx_http_request(endpoint, 80, method='PUT')
         return self.do_request_common()
 
+    def do_post(self, content_type, req_body):
+        self.orch.send_nginx_http_request('/http', 80, method='POST',
+                                          headers={'content-type': content_type}, req_body=req_body)
+        return self.do_request_common()
+
     def do_request_common(self):
         rep = self.orch.find_first_appsec_report()
         if rep is None:
@@ -428,3 +433,39 @@ class TestSecAddresses(case.TestCase):
         self.assertEqual(
             result['triggers'][0]['rule_matches'][0]['parameters'][0]
             ['highlight'][0], '<Redacted>')
+
+    def test_post_json_key(self):
+        result = self.do_post('application/json', '{"matched key":42}')
+        self.assertEqual(
+            result['triggers'][0]['rule_matches'][0]['parameters'][0]['value'],
+            'matched key')
+
+    def test_post_json_key_2(self):
+        result = self.do_post('application/json', '[[],{"a":{"matched key":42}}]')
+        self.assertEqual(
+            result['triggers'][0]['rule_matches'][0]['parameters'][0]['value'],
+            'matched key')
+
+    def test_post_json_key_3(self):
+        result = self.do_post('application/json', '[[],{"a":{"matched key":')
+        self.assertEqual(
+            result['triggers'][0]['rule_matches'][0]['parameters'][0]['value'],
+            'matched key')
+
+    def test_post_json_value(self):
+        result = self.do_post('application/json', '"matched value"')
+        self.assertEqual(
+            result['triggers'][0]['rule_matches'][0]['parameters'][0]['value'],
+            'matched value')
+
+    def test_post_json_value_2(self):
+        result = self.do_post('application/json', '[[[0, {"a": "matched value"}]]]')
+        self.assertEqual(
+            result['triggers'][0]['rule_matches'][0]['parameters'][0]['value'],
+            'matched value')
+
+    def test_post_json_value_3(self):
+        result = self.do_post('application/json', '[[[0, {"a": "matched value"')
+        self.assertEqual(
+            result['triggers'][0]['rule_matches'][0]['parameters'][0]['value'],
+            'matched value')
