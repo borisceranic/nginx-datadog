@@ -118,7 +118,7 @@ if(NGINX_DATADOG_ASM_ENABLED)
     src/security/blocking.cpp
     src/security/body_parse/body_multipart.cpp
     src/security/body_parse/body_parsing.cpp
-    src/security/body_parse/content_type.cpp
+    src/security/body_parse/header.cpp
     src/security/client_ip.cpp
     src/security/collection.cpp
     src/security/context.cpp

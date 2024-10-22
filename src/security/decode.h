@@ -1,5 +1,6 @@
 #pragma once
 
+#include <charconv>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>

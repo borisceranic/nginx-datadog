@@ -7,11 +7,9 @@
 #include <cstddef>
 #include <unordered_map>
 
-#include "ddwaf.h"
-#include "ddwaf_memres.h"
-#include "ddwaf_obj.h"
-#include "security/decode.h"
-#include "util.h"
+#include "../ddwaf_obj.h"
+#include "../decode.h"
+#include "../util.h"
 
 extern "C" {
 #include <ngx_http.h>

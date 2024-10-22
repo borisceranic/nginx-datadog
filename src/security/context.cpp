@@ -22,7 +22,7 @@
 #include "../ngx_http_datadog_module.h"
 #include "../tracing_library.h"
 #include "blocking.h"
-#include "body_parsing.h"
+#include "body_parse/body_parsing.h"
 #include "collection.h"
 #include "ddwaf_obj.h"
 #include "header_tags.h"
