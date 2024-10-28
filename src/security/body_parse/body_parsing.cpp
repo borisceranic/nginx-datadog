@@ -1,5 +1,6 @@
 #include "body_parsing.h"
 
+#include <ddwaf.h>
 #include <rapidjson/error/en.h>
 #include <rapidjson/reader.h>
 
@@ -7,14 +8,16 @@
 #include <cstddef>
 #include <unordered_map>
 
+#include "../ddwaf_memres.h"
 #include "../ddwaf_obj.h"
 #include "../decode.h"
-#include "../util.h"
 
 extern "C" {
 #include <ngx_http.h>
 #include <sys/types.h>
 }
+
+using namespace std::literals;
 
 namespace dnsec = datadog::nginx::security;
 
@@ -109,43 +112,6 @@ class NgxChainInputStream {
   std::size_t read_{};
 };
 
-class DdwafObjArrPool {
- public:
-  DdwafObjArrPool(dnsec::DdwafMemres &memres) : memres_{memres} {}
-
-  dnsec::ddwaf_obj *get(std::size_t size) {
-    auto it = free_.find(size);
-    if (it != free_.end()) {
-      std::vector<dnsec::ddwaf_obj *> &free_list = it->second;
-      if (!free_list.empty()) {
-        auto *obj = free_list.back();
-        free_list.pop_back();
-        return new (obj) dnsec::ddwaf_obj[size]{};
-      }
-    }
-
-    return memres_.allocate_objects<dnsec::ddwaf_obj>(size);
-  }
-
-  dnsec::ddwaf_obj *realloc(dnsec::ddwaf_obj *arr, std::size_t cur_size,
-                            std::size_t new_size) {
-    assert(new_size > cur_size);
-    auto *new_arr = get(new_size);
-    if (cur_size > 0) {
-      std::copy_n(arr, cur_size, new_arr);
-
-      std::vector<dnsec::ddwaf_obj *> free_list = free_[cur_size];
-      free_list.emplace_back(arr);
-    }
-
-    return new_arr;
-  }
-
- private:
-  dnsec::DdwafMemres &memres_;
-  std::unordered_map<std::size_t, std::vector<dnsec::ddwaf_obj *>> free_;
-};
-
 class ToDdwafObjHandler
     : public rapidjson::BaseReaderHandler<rapidjson::UTF8<>,
                                           ToDdwafObjHandler> {
@@ -236,7 +202,7 @@ class ToDdwafObjHandler
   }
 
  private:
-  DdwafObjArrPool pool_;
+  dnsec::DdwafObjArrPool<dnsec::ddwaf_obj> pool_;
   dnsec::DdwafMemres &memres_;
   struct Buf {
     dnsec::ddwaf_obj *ptr;

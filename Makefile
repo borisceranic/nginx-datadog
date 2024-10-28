@@ -8,6 +8,7 @@ PWD ?= $(shell pwd)
 NGINX_SRC_DIR ?= $(PWD)/nginx
 ARCH ?= $(shell arch)
 COVERAGE ?= OFF
+BUILD_TESTING ?= ON
 DOCKER_REPOS ?= public.ecr.aws/b1o7r7e0/nginx_musl_toolchain
 
 SHELL := /bin/bash
@@ -17,6 +18,7 @@ build: build-deps sources
 	# -DCMAKE_C_FLAGS=-I/opt/homebrew/Cellar/pcre2/10.42/include/ -DCMAKE_CXX_FLAGS=-I/opt/homebrew/Cellar/pcre2/10.42/include/ -DCMAKE_LDFLAGS=-L/opt/homebrew/Cellar/pcre2/10.42/lib -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang
 	cmake -B$(BUILD_DIR) -DNGINX_SRC_DIR=$(NGINX_SRC_DIR) \
 		-DNGINX_COVERAGE=$(COVERAGE) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) -DNGINX_DATADOG_ASM_ENABLED=$(WAF) . \
+		-DBUILD_TESTING=$(BUILD_TESTING) \
 		&& cmake --build $(BUILD_DIR) -j $(MAKE_JOB_COUNT) -v
 	chmod 755 $(BUILD_DIR)/ngx_http_datadog_module.so
 	@echo 'build successful 👍'

@@ -1,8 +1,16 @@
 #include "header.h"
 
 #include <algorithm>
+#include <coroutine>
+#include <string_view>
+
+#include "../decode.h"
+#include "chain_is.hpp"
+#include "generator.h"
 
 using namespace std::literals;
+
+namespace dnsec = datadog::nginx::security;
 
 namespace {
 
@@ -71,37 +79,14 @@ std::optional<std::string_view> consume_wg_token(std::string_view &sv) {
   return ret;
 }
 
-std::optional<std::string_view> consume_2045_token(std::string_view &sv) {
-  static constexpr std::string_view excluded_chars =
-      R"(()<>@,;:\"/[]?=)"
-      "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0B\x0C\x0E\x0F"
-      "\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F\x7F"
-      " ";
-  auto end = sv.find_first_of(excluded_chars);
-  if (end == 0 || end == std::string_view::npos) {
-    return std::nullopt;
-  }
-  auto ret = std::optional{sv.substr(0, end)};
-  sv.remove_prefix(end);
-  return ret;
-}
-
 /*
  * https://httpwg.org/specs/rfc9110.html#quoted.strings
  * quoted-string  = DQUOTE *( qdtext / quoted-pair ) DQUOTE
  * qdtext         = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text
  * obs-text       = %x80-FF
  * quoted-pair    = "\" ( HTAB / SP / VCHAR / obs-text )
- *
- * This is more restrictive than the original definition in RFC 822:
- * https://datatracker.ietf.org/doc/html/rfc822#section-3.3
- * quoted-string = <"> *(qtext/quoted-pair) <">
- * qtext         =  <any CHAR excepting <">,      may be folded
- *                  "\" & CR, and including linear-white-space>
- * quoted-pair   =  "\" CHAR
- * CHAR          =  <any ASCII character>
  */
-std::optional<std::string> consume_quoted_string(std::string_view &sv) {
+std::optional<std::string> consume_9110_quoted_string(std::string_view &sv) {
   if (sv.front() != '"') {
     return std::nullopt;
   }
@@ -138,6 +123,109 @@ std::optional<std::string> consume_quoted_string(std::string_view &sv) {
   }
   return std::nullopt;
 }
+
+// an extended understanding of whitespace. Spec would allow only ' ' and '\t'
+inline bool is_ext_ws(unsigned char ch) {  // not include \r or \n
+  return ch == ' ' || ch == '\t' || ch == '\v' || ch == '\f';
+}
+/*
+ * Line folding, this is described in RFC 5322:
+ * FWS             =   ([*WSP CRLF] 1*WSP) / obs-FWS
+ * obs-FWS         =   1*WSP *(CRLF 1*WSP)
+ * WSP             =   SP / HTAB
+ *
+ * We deviate in the following ways, allowing for certain invalid input
+ * accepted by PHP:
+ * - allow line terminations with only \n (no \r)
+ * - consider \v and \f as whitespace
+ * - ignore invalid first lines starting with white spaces
+ *
+ * This coroutine returns characters for a single header "line", unfolded.
+ */
+dnsec::Generator<std::uint8_t> unfold_next_header(
+    dnsec::NgxChainInputStream &is) {
+initial_line:
+  if (is.eof()) {
+    co_return;
+  }
+
+  auto ch = is.read();
+  if (is_ext_ws(ch)) {
+    // starts with space, but can't be a continuation. Ignore the whole line,
+    // like PHP does. Note that we're not discarding possibly valid payload,
+    // because the Content-disposition header is mandatory. In fact, even if
+    // there were no headers, the sequence should be --<boundary>\r\n\r\n<data>
+    while (!is.eof() && (ch = is.read()) != '\n') {
+    }
+    goto initial_line;
+  } else if (ch == '\r') {
+    if (is.eof()) {
+      // unexpected end of input: \r nor followed by \n
+      co_return;
+    }
+
+    ch = is.read();
+    if (ch == '\n') {
+      // end of the headers
+      co_return;
+    }
+  } else if (ch == '\n') {
+    // allow \n without \r
+    co_return;
+  }
+
+normal_state:
+  while (true) {
+    if (ch == '\r') {
+      if (is.eof()) {
+        // unexpected end of input: \r nor followed by \n
+        co_return;
+      }
+
+      ch = is.read();
+
+      if (ch == '\n') {
+      crlf:
+        // found \r\n
+        if (is.eof()) {
+          co_return;
+        }
+
+        ch = *is;
+        if (is_ext_ws(ch)) {
+          // We're folding
+          co_yield ' ';  // yield a single space
+          // skip the rest of the space
+          do {
+            is.read();  // advance
+          } while (!is.eof() && is_ext_ws(*is));
+
+          goto normal_state;
+        } else {
+          // if CRLF is not followed by whitespace, then it's a new line and
+          // we're done. Do not consume the current char.
+          // This is the only normal finish, although we need to tolerate at the
+          // very least early eof due to limited buffering of the request body
+          co_return;
+        }
+      }
+    } else if (ch == '\n') {
+      // violation: allow \n without \r
+      goto crlf;
+    } else {
+      co_yield ch;
+    }
+
+    if (is.eof()) {
+      break;
+    }
+    ch = is.read();
+  }
+
+  // abnormal finish
+  co_return;
+}
+
 }  // namespace
 
 namespace datadog::nginx::security {
@@ -155,9 +243,14 @@ namespace datadog::nginx::security {
  *
  * This definition is taken from the HTTP spec, but we use it for multipart
  * MIME parts too.
+ *
+ * Implementation details (glimpsed from code, not verified):
+ * - PHP: boundary[^=]*=("[^"]+"|[^,;]+)
+ *   case insensitive. boundary max size is 5116
  */
-std::optional<ContentType> ContentType::for_string(std::string_view sv) {
-  ContentType ct{};
+std::optional<HttpContentType> HttpContentType::for_string(
+    std::string_view sv) {
+  HttpContentType ct{};
 
   consume_ows(sv);
 
@@ -210,7 +303,7 @@ std::optional<ContentType> ContentType::for_string(std::string_view sv) {
 
     std::string value;
     if (sv.front() == '"') {
-      std::optional<std::string> maybe_value = consume_quoted_string(sv);
+      std::optional<std::string> maybe_value = consume_9110_quoted_string(sv);
       if (!maybe_value) {
         return std::nullopt;
       }
@@ -267,63 +360,143 @@ std::optional<ContentType> ContentType::for_string(std::string_view sv) {
  *  title*1*=us-ascii'en'This%20is%20even%20more%20
  *  title*2*=%2A%2A%2Afun%2A%2A%2A%20
  *  title*3="isn't it!"
+ *
+ * No one does this. Also, the similar scheme described in RFC 5987 is
+ * explicitly proscribed by RFC 7578.
  */
+/*
+ * This method consumes all the headers of a MIME part, looking for
+ * Content-Disposition's name. It stops only on EOF or two consecutive CRLF
+ * (relaxed to allow plain LF).
+ */
+std::optional<MimeContentDisposition> MimeContentDisposition::for_stream(
+    NgxChainInputStream &is) {
+  MimeContentDisposition cd{};
 
-std::optional<ContentDisposition> ContentDisposition::for_string(
-    std::string_view sv) {
-  ContentDisposition cd{};
+  // consumes data, up until the last matching character
+  auto try_match_token = [](auto &gen, std::string_view token) {
+    std::size_t i;
+    for (i = 0; gen.has_next() && i < token.size(); i++) {
+      if (std::tolower(gen.peek()) != token[i]) {
+        break;
+      }
+      gen.next();
+    }
+    return i == token.size();
+  };
 
-  consume_ows(sv);
+  while (!is.eof()) {
+    Generator<std::uint8_t> gen = unfold_next_header(is);
+    if (!gen.has_next()) {
+      // end of headers
+      break;
+    }
 
-  auto maybe_disp = consume_2045_token(sv);
-  if (!maybe_disp) {
+    // no space allowed before :
+    static constexpr std::string_view header_name_lc = "content-disposition:"sv;
+    if (!try_match_token(gen, header_name_lc)) {
+      // not the header we're looking for. Consume the rest of it and retry
+      while (gen.has_next()) {
+        gen.next();
+      }
+      continue;
+    }
+
+    // found the header
+    // skip ws after : (matches PHP behavior)
+    std::uint8_t ch;
+    while (gen.has_next() && is_ext_ws(ch = gen.next())) {
+    }
+
+    if (!gen.has_next()) {
+      // no value after content-disposition:[ \t\v\f]*
+      continue;
+    }
+
+  next_parameter:
+    // skip until we find a ;, which is what we're interested in
+    while (gen.has_next() && gen.next() != ';') {
+    }
+    // skip ws
+    while (gen.has_next() && is_ext_ws(ch = gen.peek())) {
+      gen.next();
+    }
+    if (!gen.has_next()) {
+      // no more parameters
+      continue;
+    }
+
+    std::string header_name;
+    bool is_name = try_match_token(gen, "name=");
+    if (!is_name) {
+      // try to find = or ;
+      while (gen.has_next()) {
+        auto ch = gen.next();
+        if (ch == '=') {
+          // break so we can process the value. We can't just advance
+          // to the next ; because the next ; may be quoted
+          break;
+        } else if (ch == ';') {
+          goto next_parameter;
+        }
+      }
+    }
+
+    if (!gen.has_next()) {
+      // no value after <parameter>=
+      continue;
+    }
+
+    /*
+     * https://datatracker.ietf.org/doc/html/rfc822#section-3.3
+     * quoted-string = <"> *(qtext/quoted-pair) <">
+     * qtext         =  <any CHAR excepting <">,      may be folded
+     *                  "\" & CR, and including linear-white-space>
+     * quoted-pair   =  "\" CHAR
+     * CHAR          =  <any ASCII character>
+     *
+     * Browsers, however, deviate from this. Backlashes (\) are not used for
+     * escaping, and so should be interpreted literally. Also, browsers send
+     * bytes with the high bit set, in the same encoding as the html document.
+     * This encoding is not transmitted by the browsers in any header.
+     */
+    std::string value;
+    if (gen.peek() == '"') {
+      gen.next();  // skip "
+      while (gen.has_next() && (ch = gen.next()) != '"') {
+        value.push_back(ch);
+      }
+      if (ch != '"') {
+        // end of line before closing quote. Ignore value
+        continue;
+      }
+
+      if (is_name) {
+        // we got what we wanted
+        cd.name = std::move(value);
+      }
+      // maybe we got name= a second time though
+      goto next_parameter;
+    } else {
+      std::string value;
+      // continue until we get a space, tab, ;, or end of input
+      while (gen.has_next() && (ch = gen.peek()) != ' ' && ch != '\t' &&
+             ch != ';') {
+        value.push_back(ch);
+        gen.next();
+      }
+
+      if (!value.empty() && is_name) {
+        cd.name = std::move(value);
+      }
+      goto next_parameter;
+    }
+  }  // while (!is.eof())
+
+  if (cd.name.empty()) {
     return std::nullopt;
   }
 
-  cd.disposition = to_lc(*maybe_disp);
-
-  while (true) {
-    consume_ows(sv);
-    if (sv.empty()) {
-      return std::move(cd);
-    }
-    if (sv != ";") {
-      return std::nullopt;
-    }
-    sv.remove_prefix(1);
-    consume_ows(sv);
-
-    // trailing ; doesn't seem allowed above, but...
-    if (sv.empty()) {
-      return std::move(cd);
-    }
-
-    auto maybe_param_name = consume_2045_token(sv);
-    if (!maybe_param_name) {
-      return std::nullopt;
-    }
-
-    consume_ows(sv);
-    if (sv.empty() || sv.front() != '=') {
-      return std::nullopt;
-    }
-    sv.remove_prefix(1);
-
-    if (sv.empty()) {
-      return std::nullopt;
-    }
-    if (sv.front() == '"') {
-      std::optional<std::string> maybe_value = consume_quoted_string(sv);
-      if (!maybe_value) {
-        return std::nullopt;
-      }
-      std::string value = *maybe_value;
-      if (equals_ci(*maybe_param_name, "filename"sv)) {
-        cd.filename = value;
-      } else if (equals_ci(*maybe_param_name, "name"sv)) {
-        cd.name = value;
-      }
-    }
-  }
+  return std::move(cd);
 }
 }  // namespace datadog::nginx::security

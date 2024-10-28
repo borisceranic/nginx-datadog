@@ -4,24 +4,25 @@
 #include <string>
 #include <string_view>
 
+#include "chain_is.hpp"
+
 namespace datadog::nginx::security {
 
-struct ContentType {
+struct HttpContentType {
   std::string type;
   std::string subtype;
   std::string encoding;
   std::string boundary;
 
   // see https://httpwg.org/specs/rfc9110.html#field.content-type
-  static std::optional<ContentType> for_string(std::string_view sv);
+  static std::optional<HttpContentType> for_string(std::string_view sv);
 };
 
-struct ContentDisposition {
-  std::string disposition;
-  std::string filename;
+struct MimeContentDisposition {
   std::string name;
 
-  static std::optional<ContentDisposition> for_string(std::string_view sv);
+  static std::optional<MimeContentDisposition> for_stream(
+      NgxChainInputStream &is);
 };
 
 }  // namespace datadog::nginx::security

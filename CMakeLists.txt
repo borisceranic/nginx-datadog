@@ -26,6 +26,12 @@ else ()
   message(STATUS "nginx-datadog products: tracing")
 endif ()
 
+include(CTest)
+
+if(BUILD_TESTING)
+  add_subdirectory(test/unit EXCLUDE_FROM_ALL)
+endif()
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -ggdb -O0")
   set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -ggdb -O0")
@@ -89,7 +95,13 @@ configure_file(src/version.cpp.in ${CMAKE_BINARY_DIR}/version.cpp)
 # The shared library (nginx module) that we are building.
 add_library(ngx_http_datadog_module SHARED)
 
-target_sources(ngx_http_datadog_module
+# cmake requires at least one source file
+file(WRITE "${CMAKE_BINARY_DIR}/dummy.c" "")
+target_sources(ngx_http_datadog_module PRIVATE "${CMAKE_BINARY_DIR}/dummy.c")
+
+add_library(ngx_http_datadog_static_lib STATIC)
+set_target_properties(ngx_http_datadog_static_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_sources(ngx_http_datadog_static_lib
   PRIVATE
     src/array_util.cpp
     src/datadog_conf.cpp
@@ -113,7 +125,7 @@ target_sources(ngx_http_datadog_module
 )
 
 if(NGINX_DATADOG_ASM_ENABLED)
-  target_sources(ngx_http_datadog_module
+  target_sources(ngx_http_datadog_static_lib
     PRIVATE
     src/security/blocking.cpp
     src/security/body_parse/body_multipart.cpp
@@ -123,18 +135,21 @@ if(NGINX_DATADOG_ASM_ENABLED)
     src/security/collection.cpp
     src/security/context.cpp
     src/security/ddwaf_obj.cpp
+    src/security/decode.cpp
     src/security/header_tags.cpp
     src/security/library.cpp
     src/security/waf_remote_cfg.cpp)
-  target_compile_definitions(ngx_http_datadog_module PRIVATE WITH_WAF)
+  target_compile_definitions(ngx_http_datadog_static_lib PRIVATE WITH_WAF)
 endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_compile_options(ngx_http_datadog_module PRIVATE -Wall -Werror)
+  target_compile_options(ngx_http_datadog_static_lib PRIVATE -Wall -Werror)
 endif()
 
 if(NGINX_COVERAGE)
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    target_compile_options(ngx_http_datadog_static_lib PRIVATE
+      -fprofile-instr-generate -fcoverage-mapping -mllvm -runtime-counter-relocation=true)
     target_compile_options(ngx_http_datadog_module PRIVATE
       -fprofile-instr-generate -fcoverage-mapping -mllvm -runtime-counter-relocation=true)
     target_link_options(ngx_http_datadog_module PRIVATE
@@ -145,19 +160,22 @@ if(NGINX_COVERAGE)
   endif()
 endif()
 
-target_include_directories(ngx_http_datadog_module
-  PRIVATE
+target_include_directories(ngx_http_datadog_static_lib
+  PUBLIC
     src/
 )
 
-target_link_libraries(ngx_http_datadog_module
+target_link_libraries(ngx_http_datadog_static_lib PUBLIC
   dd_trace_cpp-static
   nginx_module
   nlohmann_json::nlohmann_json # comes from dd-trace-cpp
 )
+target_link_libraries(ngx_http_datadog_module PRIVATE
+  ngx_http_datadog_static_lib
+)
 
 if(NGINX_DATADOG_ASM_ENABLED)
-  target_link_libraries(ngx_http_datadog_module rapidjson libddwaf_objects)
+  target_link_libraries(ngx_http_datadog_static_lib PUBLIC rapidjson libddwaf_objects)
 endif()
 
 # Remove the "lib" prefix to match NGINX convention
@@ -168,7 +186,7 @@ if(CMAKE_COMPILER_IS_GNUCXX OR (CMAKE_CXX_COMPILER_ID MATCHES "Clang"))
     set_property(TARGET ngx_http_datadog_module PROPERTY SUFFIX ".so")
     target_link_options(ngx_http_datadog_module PRIVATE -undefined dynamic_lookup)
   else()
-    target_link_libraries(ngx_http_datadog_module -static-libstdc++ -static-libgcc)
+    target_link_options(ngx_http_datadog_module PRIVATE -static-libstdc++ -static-libgcc)
   endif()
 endif()
 

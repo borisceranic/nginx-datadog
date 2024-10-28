@@ -1,80 +1,129 @@
 #include "body_multipart.h"
 
 #include <string_view>
+#include <unordered_map>
+#include <utility>
 
+#include "../ddwaf_memres.h"
 #include "../ddwaf_obj.h"
+#include "chain_is.hpp"
 #include "header.h"
 
 extern "C" {
 #include <ngx_core.h>
 }
 
+namespace dnsec = datadog::nginx::security;
+
 namespace {
-
-class NgxChainInputStream {
- public:
-  NgxChainInputStream(const ngx_chain_t *chain) : current_{chain} {
-    if (current_) {
-      pos_ = current_->buf->pos;
-      end_ = current_->buf->last;
+enum class LineType { BOUNDARY, BOUNDARY_END, OTHER, END_OF_FILE };
+auto bind_consume_line(dnsec::HttpContentType &ct,
+                       std::unique_ptr<std::uint8_t[]> &bound_buf,
+                       std::size_t beg_bound_size) {
+  return [&ct, &bound_buf, beg_bound_size](dnsec::NgxChainInputStream &is,
+                                           std::string *append) {
+    std::size_t read =
+        is.read_until(bound_buf.get(), bound_buf.get() + beg_bound_size, '\n');
+    if (read == 0) {
+      return LineType::END_OF_FILE;
     }
-  }
-
-  std::uint8_t read() {
-    if (pos_ == end_) {
-      if (!advance_buffer()) {
-        return 0;
+    if (bound_buf[read - 1] == '\n') {
+      // too small; can't be boundary. The buffer is not long enough to include
+      // --boundary\n
+      if (append) {
+        std::copy_n(bound_buf.get(), read, std::back_inserter(*append));
       }
+      return LineType::OTHER;
     }
-    return *pos_++;
-  }
 
-  std::size_t read(std::uint8_t *buffer, size_t buf_size) {
-    std::size_t read = 0;
-    while (read > 0) {
-      if (pos_ == end_) {
-        if (!advance_buffer()) {
-          return read;
+    // the input may have been truncated (we don't buffer the whole request)
+    // so assume we saw a boundary if we see at least part of it
+    if (is.eof() && read < beg_bound_size) {
+      bool matched = true;
+      for (std::size_t i = 0; matched && i < read; i++) {
+        if (i < 3) {
+          matched = bound_buf[i] == '-';
+        } else {
+          matched = bound_buf[i] == ct.boundary[i - 2];
         }
       }
-      std::size_t to_read =
-          std::min(static_cast<std::size_t>(end_ - pos_), buf_size - read);
-      std::copy_n(pos_, to_read, buffer + read);
-      read += to_read;
+
+      if (matched) {
+        return LineType::BOUNDARY_END;
+      }
     }
-    return read;
+
+    if (read == beg_bound_size && std::memcmp(bound_buf.get(), "--", 2) == 0 &&
+        std::memcmp(bound_buf.get() + 2, ct.boundary.data(),
+                    ct.boundary.size()) == 0) {
+      // we found the boundary. It doesn't matter if the line contains
+      // extra characters (see RFC 2046)
+      std::uint8_t ch{};
+      LineType res;
+      if (!is.eof() && (ch = is.read()) == '-' && !is.eof() &&
+          ((ch = is.read()) == '-')) {
+        res = LineType::BOUNDARY_END;
+      } else {
+        res = LineType::BOUNDARY;
+      }
+
+      // discard the rest of the line
+      if (ch != '\n') {
+        while (!is.eof() && is.read() != '\n') {
+        }
+      }
+
+      return res;
+    } else {
+      // not a boundary
+      if (append) {
+        std::copy_n(bound_buf.get(), read, std::back_inserter(*append));
+        while (!is.eof()) {
+          std::uint8_t ch = is.read();
+          append->push_back(ch);
+          if (ch == '\n') {
+            break;
+          }
+        }
+      } else {
+        while (!is.eof() && is.read() != '\n') {
+        }
+      }
+      return LineType::OTHER;
+    }
+  };
+}
+
+struct Buf {
+  dnsec::ddwaf_obj *ptr;
+  std::size_t len;
+  std::size_t cap;
+
+  void extend(dnsec::DdwafObjArrPool<dnsec::ddwaf_obj> &pool) {
+    std::size_t new_cap = cap * 2;
+    if (new_cap == 0) {
+      new_cap = 1;
+    }
+    ptr = pool.realloc(ptr, cap, new_cap);
+    cap = new_cap;
   }
 
-  bool eof() const {
-    if (pos_ == end_) {
-      return current_ == nullptr || current_->next == nullptr;
+  dnsec::ddwaf_obj &new_slot(dnsec::DdwafObjArrPool<dnsec::ddwaf_obj> &pool) {
+    if (len == cap) {
+      extend(pool);
     }
-    return false;
+    return ptr[len - 1];
   }
-
- private:
-  bool advance_buffer() {
-    if (current_->next) {
-      current_ = current_->next;
-      pos_ = current_->buf->pos;
-      end_ = current_->buf->last;
-      return true;
-    }
-    return false;
-  }
-
-  const ngx_chain_t *current_;
-  u_char *pos_{};
-  u_char *end_{};
 };
+
 }  // namespace
 
 namespace datadog::nginx::security {
 
-bool parse_multipart(ddwaf_obj &slot, ngx_http_request_t &req, ContentType &ct,
-                     const ngx_chain_t &chain, std::size_t size,
-                     DdwafMemres &memres) {
-  if (ct.boundary.size() == 0 || ct.boundary.size() > 70) {
+bool parse_multipart(ddwaf_obj &slot, ngx_http_request_t &req,
+                     HttpContentType &ct, const ngx_chain_t &chain,
+                     std::size_t size, DdwafMemres &memres) {
+  if (ct.boundary.size() == 0) {
     ngx_log_error(NGX_LOG_NOTICE, req.connection->log, 0,
                   "multipart boundary is invalid: %s", ct.boundary.c_str());
   } else {
@@ -83,43 +132,95 @@ bool parse_multipart(ddwaf_obj &slot, ngx_http_request_t &req, ContentType &ct,
   }
   NgxChainInputStream stream{&chain};
 
-  std::vector<std::uint8_t> bound_buf;
-  bound_buf.reserve(2 /* -- */ + ct.boundary.size() + 2 /* \r\n */);
+  std::unique_ptr<std::uint8_t[]> bound_buf;
+  std::size_t beg_bound_size = 2 /* -- */ + ct.boundary.size();
+  bound_buf.reset(new std::uint8_t[beg_bound_size]);
+  auto consume_line = bind_consume_line(ct, bound_buf, beg_bound_size);
+
+  // find first boundary, discarding everything before it
   while (!stream.eof()) {
-    // 1. find beginning boundary
-    std::size_t read = stream.read(bound_buf.data(), bound_buf.size());
-    if (read < bound_buf.size()) {
+    auto line_type = consume_line(stream, nullptr);
+    if (line_type == LineType::BOUNDARY) {
+      break;
+    } else if (line_type == LineType::BOUNDARY_END) {
       ngx_log_error(NGX_LOG_NOTICE, req.connection->log, 0,
-                    "multipart: expected boundary, got EOF");
+                    "multipart: found end boundary before first boundary");
       return false;
     }
-
-    const std::uint8_t *p = bound_buf.data();
-    if (*p++ != '-' || *p++ != '-') {
-      ngx_log_error(NGX_LOG_NOTICE, req.connection->log, 0,
-                    "multipart: expected --, got: %c%c", bound_buf[0],
-                    bound_buf[1]);
-      return false;
-    }
-
-    if (std::memcmp(p, ct.boundary.data(), ct.boundary.size()) != 0) {
-      ngx_log_error(NGX_LOG_NOTICE, req.connection->log, 0,
-                    "multipart: did not see the correct boundary after --");
-      return false;
-    }
-    p += ct.boundary.size();
-
-    if (*p++ != '\r' || *p++ != '\n') {
-      ngx_log_error(NGX_LOG_NOTICE, req.connection->log, 0,
-                    "multipart: expected \\r\\n, got: %c%c", bound_buf[0],
-                    bound_buf[1]);
-      return false;
-    }
-
-    // 2.
   }
 
-  return false;
+  if (stream.eof()) {
+    ngx_log_error(NGX_LOG_NOTICE, req.connection->log, 0,
+                  "multipart: eof right after first boundary");
+    return false;
+  }
+
+  DdwafObjArrPool<ddwaf_obj> pool{memres};
+  std::unordered_map<std::string, Buf> data;
+
+start_part:
+  // headers after the previous boundary
+  std::optional<MimeContentDisposition> cd =
+      MimeContentDisposition::for_stream(stream);
+  if (!cd) {
+    ngx_log_error(NGX_LOG_NOTICE, req.connection->log, 0,
+                  "multipart: did not find Content-Disposition header");
+  }
+
+  // content
+  {
+    std::string content;
+    while (!stream.eof()) {
+      auto line_type = consume_line(stream, &content);
+
+      if (line_type == LineType::BOUNDARY ||
+          line_type == LineType::BOUNDARY_END) {
+        // finished content
+        // the \r\n preceding the boundary is deemed part of the boundary
+        if (content.size() >= 1 && content.back() == '\n') {
+          content.pop_back();
+          if (content.size() >= 1 && content.back() == '\r') {
+            content.pop_back();
+          }
+        }
+
+        if (cd) {
+          auto &buf = data[cd->name];
+          buf.new_slot(pool).make_string({content.data(), content.size()},
+                                         memres);
+        }
+
+        if (line_type == LineType::BOUNDARY_END) {
+          break;
+        }
+        if (!stream.eof()) {
+          goto start_part;
+        }
+      } else if (line_type == LineType::END_OF_FILE) {
+        ngx_log_error(NGX_LOG_NOTICE, req.connection->log, 0,
+                      "multipart: eof before end boundary");
+        return false;
+      }  // else it was LineType::OTHER and there's nothing to do
+    }
+  }
+
+  if (data.empty()) {
+    return false;
+  }
+
+  auto &map = slot.make_map(data.size(), memres);
+  std::size_t i = 0;
+  for (auto &[key, buf] : data) {
+    auto &map_slot = map.at_unchecked(i);
+    map_slot.set_key(key);
+    if (buf.len == 1) {
+      map_slot.shallow_copy_val_from(buf.ptr[0]);
+    } else {
+      map_slot.make_array(buf.ptr, buf.len);
+    }
+  }
+
+  return true;
 }
 
 }  // namespace datadog::nginx::security
