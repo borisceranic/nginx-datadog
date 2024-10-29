@@ -54,6 +54,12 @@ struct __attribute__((__may_alias__)) ddwaf_obj : ddwaf_object {
 
   bool is_string() const noexcept { return type == DDWAF_OBJ_STRING; }
 
+  bool is_map() const noexcept { return type == DDWAF_OBJ_MAP; }
+
+  bool is_array() const noexcept { return type == DDWAF_OBJ_ARRAY; }
+
+  auto size_unchecked() { return nbEntries; }
+
   template <typename T>
   T numeric_val() const {
     static constexpr auto min = std::numeric_limits<T>::min();
@@ -246,7 +252,7 @@ struct __attribute__((__may_alias__)) ddwaf_arr_obj : ddwaf_obj {
     return *reinterpret_cast<T *>(&array[index]);  // NOLINT
   }
 
-  template <typename T = ddwaf_object>
+  template <typename T = ddwaf_obj>
   T &at(nb_entries_t index) const {
     if (index >= nbEntries) {
       throw std::out_of_range("index out of range");

@@ -1,6 +1,6 @@
-FROM alpine:3.18.3 AS sysroot
+FROM alpine:3.20.3 AS sysroot
 
-ARG LLVM_VERSION=16.0.6
+ARG LLVM_VERSION=17.0.6
 ARG ARCH
 
 COPY CHECKSUMS /CHECKSUMS
@@ -52,13 +52,13 @@ RUN mkdir -p /sysroot/${ARCH}-none-linux-musl/usr
 RUN ln -s /usr/lib /sysroot/${ARCH}-none-linux-musl/usr/
 RUN ln -s /usr/include /sysroot/${ARCH}-none-linux-musl/usr/
 RUN ln -s /lib /sysroot/${ARCH}-none-linux-musl/
-RUN ln -s /usr/lib/llvm16/lib/clang/16/lib /sysroot/${ARCH}-none-linux-musl/usr/lib/resource_dir/lib
+RUN ln -s /usr/lib/llvm${LLVM_VERSION%%.*}/lib/clang/${LLVM_VERSION%%.*}/lib /sysroot/${ARCH}-none-linux-musl/usr/lib/resource_dir/lib
 
 COPY Toolchain.cmake.${ARCH} /sysroot/${ARCH}-none-linux-musl/Toolchain.cmake
 
 # see https://github.com/llvm/llvm-project/issues/60572
-RUN mv /usr/lib/gcc/${ARCH}-alpine-linux-musl/12.2.1/include/stdatomic.h /usr/lib/gcc/${ARCH}-alpine-linux-musl/12.2.1/include/stdatomic.h_
-RUN cp /usr/lib/llvm16/lib/clang/16/include/stdatomic.h /usr/lib/gcc/${ARCH}-alpine-linux-musl/12.2.1/include/stdatomic.h
+RUN mv /usr/lib/gcc/${ARCH}-alpine-linux-musl/13.2.1/include/stdatomic.h /usr/lib/gcc/${ARCH}-alpine-linux-musl/13.2.1/include/stdatomic.h_
+RUN cp /usr/lib/llvm${LLVM_VERSION%%.*}/lib/clang/${LLVM_VERSION%%.*}/include/stdatomic.h /usr/lib/gcc/${ARCH}-alpine-linux-musl/13.2.1/include/stdatomic.h
 
 COPY glibc_compat.c /sysroot/
 RUN clang --sysroot /sysroot/${ARCH}-none-linux-musl/ -fpie -O2 -fno-omit-frame-pointer \

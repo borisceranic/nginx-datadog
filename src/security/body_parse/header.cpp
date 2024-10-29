@@ -1,7 +1,7 @@
 #include "header.h"
 
 #include <algorithm>
-#include <coroutine>
+#include <iterator>
 #include <string_view>
 
 #include "../decode.h"
@@ -29,7 +29,7 @@ inline bool equals_ci(std::string_view a, std::string_view lc_b) {
 inline std::string to_lc(std::string_view sv) {
   std::string result;
   result.reserve(sv.size());
-  std::transform(sv.begin(), sv.end(), result.begin(),
+  std::transform(sv.begin(), sv.end(), std::back_inserter(result),
                  [](unsigned char c) { return std::tolower(c); });
   return result;
 }
@@ -71,8 +71,11 @@ std::optional<std::string_view> consume_wg_token(std::string_view &sv) {
       "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
       "0123456789!#$%&'*+-.^_`|~";
   auto end = sv.find_first_not_of(tchar);
-  if (end == 0 || end == std::string_view::npos) {
+  if (end == 0) {
     return std::nullopt;
+  }
+  if (end == std::string_view::npos) {
+    end = sv.size();
   }
   auto ret = std::optional{sv.substr(0, end)};
   sv.remove_prefix(end);
@@ -174,15 +177,12 @@ initial_line:
     co_return;
   }
 
-normal_state:
   while (true) {
     if (ch == '\r') {
       if (is.eof()) {
         // unexpected end of input: \r nor followed by \n
         co_return;
       }
-
-      ch = is.read();
 
       if (ch == '\n') {
       crlf:
@@ -191,16 +191,17 @@ normal_state:
           co_return;
         }
 
-        ch = *is;
+        ch = *is;  // peek; do not consume has it may be part of the next header
+                   // or the end of the headers
         if (is_ext_ws(ch)) {
           // We're folding
-          co_yield ' ';  // yield a single space
-          // skip the rest of the space
+          // skip the current ws and then the rest of the ws
           do {
-            is.read();  // advance
-          } while (!is.eof() && is_ext_ws(*is));
+            is.read();
+          } while (!is.eof() && is_ext_ws(*is) /* peek */);
 
-          goto normal_state;
+          // at this point either eof, or we do ch = is.read() (returns non-ws)
+          // and restart the loop
         } else {
           // if CRLF is not followed by whitespace, then it's a new line and
           // we're done. Do not consume the current char.
@@ -259,37 +260,36 @@ std::optional<HttpContentType> HttpContentType::for_string(
     return std::nullopt;
   }
   ct.type = to_lc(*maybe_type);
-  sv.remove_prefix(maybe_type->size());
 
   if (sv.empty() || sv.front() != '/') {
     return std::nullopt;
   }
-  sv.remove_prefix('/');
+  sv.remove_prefix(1);
 
   auto maybe_subtype = consume_wg_token(sv);
   if (!maybe_subtype) {
     return std::nullopt;
   }
   ct.subtype = to_lc(*maybe_subtype);
-  sv.remove_prefix(maybe_subtype->size());
 
   while (true) {
     consume_ows(sv);
     if (sv.empty()) {
-      return std::move(ct);
+      return ct;
     }
-    if (sv != ";") {
+    if (sv.front() != ';') {
       return std::nullopt;
     }
+    sv.remove_prefix(1);
     consume_ows(sv);
 
     if (sv.empty()) {
-      return std::move(ct);
+      return ct;
     }
 
     std::optional<std::string_view> maybe_param_name = consume_wg_token(sv);
     if (!maybe_param_name) {
-      return std::nullopt;
+      continue;
     }
 
     if (sv.empty() || sv.front() != '=') {
@@ -308,6 +308,12 @@ std::optional<HttpContentType> HttpContentType::for_string(
         return std::nullopt;
       }
       value = *maybe_value;
+    } else {
+      auto maybe_value = consume_wg_token(sv);
+      if (!maybe_value) {
+        return std::nullopt;
+      }
+      value = *maybe_value;
     }
 
     if (equals_ci(*maybe_param_name, "charset"sv)) {
@@ -316,6 +322,8 @@ std::optional<HttpContentType> HttpContentType::for_string(
       ct.boundary = value;
     }
   }
+
+  return ct;
 }
 
 /*
@@ -417,6 +425,7 @@ std::optional<MimeContentDisposition> MimeContentDisposition::for_stream(
     // skip until we find a ;, which is what we're interested in
     while (gen.has_next() && gen.next() != ';') {
     }
+  next_parameter_after_semicolon:
     // skip ws
     while (gen.has_next() && is_ext_ws(ch = gen.peek())) {
       gen.next();
@@ -437,7 +446,7 @@ std::optional<MimeContentDisposition> MimeContentDisposition::for_stream(
           // to the next ; because the next ; may be quoted
           break;
         } else if (ch == ';') {
-          goto next_parameter;
+          goto next_parameter_after_semicolon;  // we already consumed ;
         }
       }
     }
@@ -468,12 +477,18 @@ std::optional<MimeContentDisposition> MimeContentDisposition::for_stream(
       }
       if (ch != '"') {
         // end of line before closing quote. Ignore value
-        continue;
+        continue;  // next header
       }
 
       if (is_name) {
         // we got what we wanted
-        cd.name = std::move(value);
+        if (value.find('%') != std::string::npos) {
+          // decode the value
+          cd.name = decode_urlencoded(value);
+        } else {
+          // save a copy
+          cd.name = std::move(value);
+        }
       }
       // maybe we got name= a second time though
       goto next_parameter;

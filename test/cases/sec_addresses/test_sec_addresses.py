@@ -469,3 +469,17 @@ class TestSecAddresses(case.TestCase):
         self.assertEqual(
             result['triggers'][0]['rule_matches'][0]['parameters'][0]['value'],
             'matched value')
+
+    def test_multipart_key(self):
+        result = self.do_post('multipart/form-data; boundary="bound"',
+                              '--bound\r\nContent-Disposition: form-data; name="matched key"\r\n\r\nvalue\r\n--bound--')
+        self.assertEqual(
+            result['triggers'][0]['rule_matches'][0]['parameters'][0]['value'],
+            'matched key')
+
+    def test_multipart_value(self):
+        result = self.do_post('multipart/form-data; boundary="bound"',
+                              '--bound\r\nContent-Disposition: form-data; name="key"\r\n\r\nmatched value\r\n--bound--')
+        self.assertEqual(
+            result['triggers'][0]['rule_matches'][0]['parameters'][0]['value'],
+            'matched key')

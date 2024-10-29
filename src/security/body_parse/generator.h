@@ -34,7 +34,7 @@ struct Generator {
   ~Generator() { h_.destroy(); }
   bool has_next() {
     fill();
-    return h_.done();
+    return !h_.done();
   }
   T peek() {
     fill();

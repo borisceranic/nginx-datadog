@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cassert>
 #include <cstdint>
 
 extern "C" {
@@ -24,6 +25,7 @@ class NgxChainInputStream {
   std::uint8_t operator*() {
     if (pos_ == end_) {
       if (!advance_buffer()) {
+        assert("peek over eof" == 0);
         return 0;
       }
     }
@@ -37,6 +39,7 @@ class NgxChainInputStream {
   std::uint8_t read() {
     if (pos_ == end_) {
       if (!advance_buffer()) {
+        assert("read over eof" == 0);
         return 0;
       }
     }
@@ -64,7 +67,7 @@ class NgxChainInputStream {
   std::size_t read_until(Iter begin, Iter end, std::uint8_t delim) {
     // could be optimized
     auto w = begin;
-    while (w < end) {
+    while (!eof() && w < end) {
       auto ch = read();
       *w++ = ch;
       if (ch == delim) {
@@ -72,7 +75,7 @@ class NgxChainInputStream {
       }
     }
 
-    return end - w;
+    return w - begin;
   }
 
   bool eof() const {

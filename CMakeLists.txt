@@ -128,6 +128,7 @@ if(NGINX_DATADOG_ASM_ENABLED)
   target_sources(ngx_http_datadog_static_lib
     PRIVATE
     src/security/blocking.cpp
+    src/security/body_parse/body_json.cpp
     src/security/body_parse/body_multipart.cpp
     src/security/body_parse/body_parsing.cpp
     src/security/body_parse/header.cpp
@@ -148,13 +149,15 @@ endif()
 
 if(NGINX_COVERAGE)
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    target_compile_options(ngx_http_datadog_static_lib PRIVATE
+    target_compile_options(ngx_http_datadog_static_lib PUBLIC
       -fprofile-instr-generate -fcoverage-mapping -mllvm -runtime-counter-relocation=true)
-    target_compile_options(ngx_http_datadog_module PRIVATE
-      -fprofile-instr-generate -fcoverage-mapping -mllvm -runtime-counter-relocation=true)
-    target_link_options(ngx_http_datadog_module PRIVATE
+    target_link_options(ngx_http_datadog_static_lib INTERFACE
       -fprofile-instr-generate -mllvm -runtime-counter-relocation=true)
     target_sources(ngx_http_datadog_module PRIVATE src/coverage_fixup.c)
+    if(APPLE)
+      # pass --coverage so the linker is instructed to link against libclang_rt.profile_osx.
+      target_link_options(ngx_http_datadog_static_lib INTERFACE -v --coverage)
+    endif()
   else()
     message(FATAL_ERROR "NGINX_COVERAGE is only supported with clang")
   endif()

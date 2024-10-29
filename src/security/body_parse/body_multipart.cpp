@@ -1,7 +1,7 @@
 #include "body_multipart.h"
 
+#include <map>
 #include <string_view>
-#include <unordered_map>
 #include <utility>
 
 #include "../ddwaf_memres.h"
@@ -41,7 +41,7 @@ auto bind_consume_line(dnsec::HttpContentType &ct,
     if (is.eof() && read < beg_bound_size) {
       bool matched = true;
       for (std::size_t i = 0; matched && i < read; i++) {
-        if (i < 3) {
+        if (i < 2) {
           matched = bound_buf[i] == '-';
         } else {
           matched = bound_buf[i] == ct.boundary[i - 2];
@@ -112,17 +112,26 @@ struct Buf {
     if (len == cap) {
       extend(pool);
     }
-    return ptr[len - 1];
+    return ptr[len++];
   }
 };
 
+void remove_final_crlf(std::string &content) {
+  // support also terminations with plain LF instead of CRLF
+  if (content.size() >= 1 && content.back() == '\n') {
+    content.pop_back();
+    if (content.size() >= 1 && content.back() == '\r') {
+      content.pop_back();
+    }
+  }
+}
 }  // namespace
 
 namespace datadog::nginx::security {
 
 bool parse_multipart(ddwaf_obj &slot, ngx_http_request_t &req,
                      HttpContentType &ct, const ngx_chain_t &chain,
-                     std::size_t size, DdwafMemres &memres) {
+                     DdwafMemres &memres) {
   if (ct.boundary.size() == 0) {
     ngx_log_error(NGX_LOG_NOTICE, req.connection->log, 0,
                   "multipart boundary is invalid: %s", ct.boundary.c_str());
@@ -156,7 +165,7 @@ bool parse_multipart(ddwaf_obj &slot, ngx_http_request_t &req,
   }
 
   DdwafObjArrPool<ddwaf_obj> pool{memres};
-  std::unordered_map<std::string, Buf> data;
+  std::map<std::string, Buf> data;
 
 start_part:
   // headers after the previous boundary
@@ -170,37 +179,43 @@ start_part:
   // content
   {
     std::string content;
-    while (!stream.eof()) {
+    while (true) {
       auto line_type = consume_line(stream, &content);
+
+      if (line_type == LineType::OTHER) {
+        continue;
+      }
+
+      // o/wise finished content (boundary/boundary_end/eof)
 
       if (line_type == LineType::BOUNDARY ||
           line_type == LineType::BOUNDARY_END) {
-        // finished content
         // the \r\n preceding the boundary is deemed part of the boundary
-        if (content.size() >= 1 && content.back() == '\n') {
-          content.pop_back();
-          if (content.size() >= 1 && content.back() == '\r') {
-            content.pop_back();
-          }
-        }
+        remove_final_crlf(content);
+      }
 
-        if (cd) {
-          auto &buf = data[cd->name];
-          buf.new_slot(pool).make_string({content.data(), content.size()},
-                                         memres);
-        }
-
-        if (line_type == LineType::BOUNDARY_END) {
-          break;
-        }
-        if (!stream.eof()) {
-          goto start_part;
-        }
-      } else if (line_type == LineType::END_OF_FILE) {
+      if (line_type == LineType::END_OF_FILE) {
         ngx_log_error(NGX_LOG_NOTICE, req.connection->log, 0,
                       "multipart: eof before end boundary");
-        return false;
-      }  // else it was LineType::OTHER and there's nothing to do
+        // we could have been followed by a boundary that was truncated,
+        // so remove final CRLF, LF, or CR
+        remove_final_crlf(content);
+        if (content.size() >= 1 && content.back() == '\r') {
+          content.pop_back();
+        }
+      }
+
+      if (cd) {
+        auto &buf = data[cd->name];
+        buf.new_slot(pool).make_string({content.data(), content.size()},
+                                       memres);
+      }
+
+      if (line_type == LineType::BOUNDARY && !stream.eof()) {
+        goto start_part;
+      }
+
+      break;
     }
   }
 
@@ -211,9 +226,10 @@ start_part:
   auto &map = slot.make_map(data.size(), memres);
   std::size_t i = 0;
   for (auto &[key, buf] : data) {
-    auto &map_slot = map.at_unchecked(i);
-    map_slot.set_key(key);
+    auto &map_slot = map.at_unchecked(i++);
+    map_slot.set_key(key, memres);
     if (buf.len == 1) {
+      // if only one element, put the string directly under that key
       map_slot.shallow_copy_val_from(buf.ptr[0]);
     } else {
       map_slot.make_array(buf.ptr, buf.len);

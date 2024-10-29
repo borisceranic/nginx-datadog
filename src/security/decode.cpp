@@ -2,6 +2,7 @@
 
 #include <charconv>
 #include <cstring>
+#include <iterator>
 
 namespace {
 
@@ -21,22 +22,22 @@ std::string decode_percent(std::string_view sv) {
   enum class state { NORMAL, PERCENT, PERCENT1 } state = state::NORMAL;
   const unsigned char *r = reinterpret_cast<const unsigned char *>(sv.data());
   const unsigned char *end = r + sv.size();
-  auto w = result.begin();
+  auto w = std::back_inserter(result);
   for (; r < end; r++) {
     switch (state) {
       case state::NORMAL:
         if (*r == '%') {
           state = state::PERCENT;
         } else {
-          *w++ = DecodePlus ? decode_plus(*r) : *r;
+          w = DecodePlus ? decode_plus(*r) : *r;
         }
         break;
       case state::PERCENT:
         if (std::isxdigit(*r)) {
           state = state::PERCENT1;
         } else {
-          *w++ = '%';
-          *w++ = decode_plus(*r);
+          w = '%';
+          w = decode_plus(*r);
           state = state::NORMAL;
         }
         break;
@@ -46,21 +47,21 @@ std::string decode_percent(std::string_view sv) {
           // can't fail
           std::from_chars(reinterpret_cast<const char *>(r - 1),
                           reinterpret_cast<const char *>(r + 1), result, 16);
-          *w++ = static_cast<unsigned char>(result);
+          w = static_cast<unsigned char>(result);
         } else {
-          *w++ = '%';
-          *w++ = *(r - 1);
-          *w++ = DecodePlus ? decode_plus(*r) : *r;
+          w = '%';
+          w = *(r - 1);
+          w = DecodePlus ? decode_plus(*r) : *r;
         }
         state = state::NORMAL;
         break;
     }
   }
   if (state == state::PERCENT) {
-    *w++ = '%';
+    w = '%';
   } else if (state == state::PERCENT1) {
-    *w++ = '%';
-    *w++ = *(sv.data() + sv.size() - 1);
+    w = '%';
+    w = *(sv.data() + sv.size() - 1);
   }
 
   return result;
