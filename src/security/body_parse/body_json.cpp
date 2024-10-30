@@ -12,13 +12,78 @@ extern "C" {
 #include <ngx_http.h>
 }
 
-namespace datadog::nginx::security {
+namespace {
+
+namespace dnsec = datadog::nginx::security;
+using dnsec::ddwaf_obj;
+
+class RapidNgxChainInputStream {
+ public:
+  using Ch = char;
+
+  RapidNgxChainInputStream(const ngx_chain_t *chain) : current_{chain} {
+    if (current_) {
+      pos_ = current_->buf->pos;
+      end_ = current_->buf->last;
+    }
+  }
+
+  Ch Peek() {  // NOLINT
+    if (make_readable()) {
+      return *pos_;
+    }
+    return '\0';
+  }
+
+  Ch Take() {  // NOLINT
+    if (make_readable()) {
+      read_++;
+      return *pos_++;
+    }
+    return '\0';
+  }
+
+  std::size_t Tell() const {  // NOLINT
+    return read_;
+  }
+
+  void Put(Ch) {  // NOLINT
+                  // Not implemented because we're only reading
+  }
+  char *PutBegin() { return nullptr; }  // NOLINT
+  size_t PutEnd(Ch *) { return 0; }     // NOLINT
+
+ private:
+  bool advance_buffer() {
+    if (current_->next) {
+      current_ = current_->next;
+      pos_ = current_->buf->pos;
+      end_ = current_->buf->last;
+      return true;
+    }
+    return false;
+  }
+
+  bool make_readable() {
+    while (pos_ == end_) {
+      if (!advance_buffer()) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  const ngx_chain_t *current_;
+  u_char *pos_{};
+  u_char *end_{};
+  std::size_t read_{};
+};
 
 class ToDdwafObjHandler
     : public rapidjson::BaseReaderHandler<rapidjson::UTF8<>,
                                           ToDdwafObjHandler> {
  public:
-  ToDdwafObjHandler(ddwaf_obj &slot, DdwafMemres &memres)
+  ToDdwafObjHandler(ddwaf_obj &slot, dnsec::DdwafMemres &memres)
       : pool_{memres}, memres_{memres}, bufs_{{&slot, 0, 1}} {}
 
   ddwaf_obj *finish(ngx_http_request_t &req) {
@@ -104,8 +169,8 @@ class ToDdwafObjHandler
   }
 
  private:
-  DdwafObjArrPool<ddwaf_obj> pool_;
-  DdwafMemres &memres_;
+  dnsec::DdwafObjArrPool<ddwaf_obj> pool_;
+  dnsec::DdwafMemres &memres_;
   struct Buf {
     ddwaf_obj *ptr;
     std::size_t len;
@@ -171,8 +236,12 @@ class ToDdwafObjHandler
   }
 };
 
+}  // namespace
+
+namespace datadog::nginx::security {
+
 bool parse_json(ddwaf_obj &slot, ngx_http_request_t &req,
-                const ngx_chain_t &chain, DdwafMemres &memres) {
+                const ngx_chain_t &chain, dnsec::DdwafMemres &memres) {
   // be as permissive as possible
   static constexpr unsigned parse_flags =
       rapidjson::kParseStopWhenDoneFlag |
@@ -182,9 +251,9 @@ bool parse_json(ddwaf_obj &slot, ngx_http_request_t &req,
 
   ToDdwafObjHandler handler{slot, memres};
   rapidjson::Reader reader;
-  NgxChainInputStream is{&chain};
+  RapidNgxChainInputStream is{&chain};
   rapidjson::ParseResult res =
-      reader.Parse<parse_flags, NgxChainInputStream>(is, handler);
+      reader.Parse<parse_flags, RapidNgxChainInputStream>(is, handler);
   ddwaf_obj *json_obj = handler.finish(req);
   if (res.IsError()) {
     if (json_obj) {

@@ -95,13 +95,11 @@ configure_file(src/version.cpp.in ${CMAKE_BINARY_DIR}/version.cpp)
 # The shared library (nginx module) that we are building.
 add_library(ngx_http_datadog_module SHARED)
 
-# cmake requires at least one source file
-file(WRITE "${CMAKE_BINARY_DIR}/dummy.c" "")
-target_sources(ngx_http_datadog_module PRIVATE "${CMAKE_BINARY_DIR}/dummy.c")
+target_sources(ngx_http_datadog_module PRIVATE ${CMAKE_BINARY_DIR}/version.cpp)
 
-add_library(ngx_http_datadog_static_lib STATIC)
-set_target_properties(ngx_http_datadog_static_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_sources(ngx_http_datadog_static_lib
+add_library(ngx_http_datadog_objs OBJECT)
+set_target_properties(ngx_http_datadog_objs PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_sources(ngx_http_datadog_objs
   PRIVATE
     src/array_util.cpp
     src/datadog_conf.cpp
@@ -121,11 +119,10 @@ target_sources(ngx_http_datadog_static_lib
     src/request_tracing.cpp
     src/string_util.cpp
     src/tracing_library.cpp
-    ${CMAKE_BINARY_DIR}/version.cpp
 )
 
 if(NGINX_DATADOG_ASM_ENABLED)
-  target_sources(ngx_http_datadog_static_lib
+  target_sources(ngx_http_datadog_objs
     PRIVATE
     src/security/blocking.cpp
     src/security/body_parse/body_json.cpp
@@ -140,45 +137,47 @@ if(NGINX_DATADOG_ASM_ENABLED)
     src/security/header_tags.cpp
     src/security/library.cpp
     src/security/waf_remote_cfg.cpp)
-  target_compile_definitions(ngx_http_datadog_static_lib PRIVATE WITH_WAF)
+  target_compile_definitions(ngx_http_datadog_objs PRIVATE WITH_WAF)
 endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_compile_options(ngx_http_datadog_static_lib PRIVATE -Wall -Werror)
+  target_compile_options(ngx_http_datadog_objs PRIVATE -Wall -Werror)
 endif()
 
 if(NGINX_COVERAGE)
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    target_compile_options(ngx_http_datadog_static_lib PUBLIC
+    target_compile_options(ngx_http_datadog_objs PUBLIC
       -fprofile-instr-generate -fcoverage-mapping -mllvm -runtime-counter-relocation=true)
-    target_link_options(ngx_http_datadog_static_lib INTERFACE
+    target_link_options(ngx_http_datadog_objs INTERFACE
       -fprofile-instr-generate -mllvm -runtime-counter-relocation=true)
     target_sources(ngx_http_datadog_module PRIVATE src/coverage_fixup.c)
     if(APPLE)
       # pass --coverage so the linker is instructed to link against libclang_rt.profile_osx.
-      target_link_options(ngx_http_datadog_static_lib INTERFACE -v --coverage)
+      target_link_options(ngx_http_datadog_objs INTERFACE -v --coverage)
     endif()
   else()
     message(FATAL_ERROR "NGINX_COVERAGE is only supported with clang")
   endif()
 endif()
 
-target_include_directories(ngx_http_datadog_static_lib
+target_include_directories(ngx_http_datadog_objs
   PUBLIC
     src/
 )
 
-target_link_libraries(ngx_http_datadog_static_lib PUBLIC
+target_link_libraries(ngx_http_datadog_objs PUBLIC
   dd_trace_cpp-static
   nginx_module
   nlohmann_json::nlohmann_json # comes from dd-trace-cpp
 )
 target_link_libraries(ngx_http_datadog_module PRIVATE
-  ngx_http_datadog_static_lib
+  ngx_http_datadog_objs
+  nginx_module # objects don't come transitively from ngx_http_datadog_objs
 )
 
 if(NGINX_DATADOG_ASM_ENABLED)
-  target_link_libraries(ngx_http_datadog_static_lib PUBLIC rapidjson libddwaf_objects)
+  target_link_libraries(ngx_http_datadog_objs PUBLIC rapidjson libddwaf_objects)
+  target_link_libraries(ngx_http_datadog_module PUBLIC libddwaf_objects)
 endif()
 
 # Remove the "lib" prefix to match NGINX convention
@@ -212,5 +211,8 @@ if(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo" AND CMAKE_SYSTEM_NAME STREQUAL "Li
   include(./cmake/split_debug_info.cmake)
   split_debug_info(ngx_http_datadog_module)
 endif()
+
+add_library(ngx_http_datadog_static_lib STATIC EXCLUDE_FROM_ALL)
+target_link_libraries(ngx_http_datadog_static_lib PUBLIC ngx_http_datadog_objs)
 
 # vim: et ts=2 sw=2:
