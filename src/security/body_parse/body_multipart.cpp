@@ -172,8 +172,8 @@ start_part:
   std::optional<MimeContentDisposition> cd =
       MimeContentDisposition::for_stream(stream);
   if (!cd) {
-    ngx_log_error(NGX_LOG_NOTICE, req.connection->log, 0,
-                  "multipart: did not find Content-Disposition header");
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, req.connection->log, 0,
+                   "multipart: did not find Content-Disposition header");
   }
 
   // content
@@ -195,8 +195,8 @@ start_part:
       }
 
       if (line_type == LineType::END_OF_FILE) {
-        ngx_log_error(NGX_LOG_NOTICE, req.connection->log, 0,
-                      "multipart: eof before end boundary");
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, req.connection->log, 0,
+                       "multipart: eof before end boundary");
         // we could have been followed by a boundary that was truncated,
         // so remove final CRLF, LF, or CR
         remove_final_crlf(content);

@@ -27,6 +27,7 @@ RUN cd llvm-project-${LLVM_VERSION}.src && mkdir -p build && cd build && \
     -DCMAKE_C_FLAGS="-fno-omit-frame-pointer -D_LIBCPP_HAS_NO_C11_ALIGNED_ALLOC=1" \
     -DCMAKE_CXX_COMPILER=clang++ \
     -DCMAKE_CXX_FLAGS="-fno-omit-frame-pointer -D_LIBCPP_HAS_NO_C11_ALIGNED_ALLOC=1" \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DLIBUNWIND_ENABLE_SHARED=OFF \
     -DLIBUNWIND_ENABLE_STATIC=ON \
     -DLIBUNWIND_USE_COMPILER_RT=ON \
@@ -69,3 +70,8 @@ RUN clang --sysroot /sysroot/${ARCH}-none-linux-musl/ -fpie -O2 -fno-omit-frame-
 
 # Install dependencies for nginx
 RUN apk add --no-cache pcre-dev pcre2-dev zlib-dev openssl-dev perl
+
+# Install Rust toolchain
+RUN apk add --no-cache curl
+RUN curl –proto ‘=https’ –tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -yq \
+  && ln -s ~/.cargo/bin/cargo /usr/bin/cargo

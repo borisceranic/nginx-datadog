@@ -29,7 +29,7 @@ endif ()
 include(CTest)
 
 if(BUILD_TESTING)
-  add_subdirectory(test/unit EXCLUDE_FROM_ALL)
+  add_subdirectory(test/unit)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -137,7 +137,7 @@ if(NGINX_DATADOG_ASM_ENABLED)
     src/security/header_tags.cpp
     src/security/library.cpp
     src/security/waf_remote_cfg.cpp)
-  target_compile_definitions(ngx_http_datadog_objs PRIVATE WITH_WAF)
+  target_compile_definitions(ngx_http_datadog_objs PUBLIC WITH_WAF)
 endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

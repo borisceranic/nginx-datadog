@@ -8,19 +8,14 @@
 #include <atomic>
 #include <charconv>
 #include <optional>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
-#include <unordered_set>
 #include <utility>
-#include <variant>
 
 #include "../datadog_conf.h"
-#include "../datadog_context.h"
 #include "../datadog_handler.h"
 #include "../ngx_http_datadog_module.h"
-#include "../tracing_library.h"
 #include "blocking.h"
 #include "body_parse/body_parsing.h"
 #include "collection.h"
@@ -388,16 +383,8 @@ bool Context::do_on_request_start(ngx_http_request_t &request, dd::Span &span) {
 
   stage st = stage_->load(std::memory_order_relaxed);
   if (st != stage::START) {
-    ngx_log_error(NGX_LOG_ERR, request.connection->log, 0,
-                  "WAF context is not in the start stage");
-    return false;
-  }
-
-  if (!stage_->compare_exchange_strong(st, stage::ENTERED_ON_START,
-                                       std::memory_order_release,
-                                       std::memory_order_relaxed)) {
-    ngx_log_error(NGX_LOG_ERR, request.connection->log, 0,
-                  "Unexpected concurrent change of stage_");
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, request.connection->log, 0,
+                   "WAF context is not in the start stage. Internal redirect?");
     return false;
   }
 
@@ -408,6 +395,15 @@ bool Context::do_on_request_start(ngx_http_request_t &request, dd::Span &span) {
     ngx_log_debug(NGX_LOG_DEBUG_HTTP, request.connection->log, 0,
                   "no waf pool name defined for this location (uri: %V)",
                   &request.uri);
+    transition_to_stage(stage::DISABLED);
+    return false;
+  }
+
+  if (!stage_->compare_exchange_strong(st, stage::ENTERED_ON_START,
+                                       std::memory_order_release,
+                                       std::memory_order_relaxed)) {
+    ngx_log_error(NGX_LOG_ERR, request.connection->log, 0,
+                  "Unexpected concurrent change of stage_");
     return false;
   }
 
@@ -707,98 +703,73 @@ class PolFinalWafCtx : public PolTaskCtx<PolFinalWafCtx> {
 ngx_int_t Context::do_request_body_filter(ngx_http_request_t &request,
                                           ngx_chain_t *in, dd::Span &span) {
   auto st = stage_->load(std::memory_order_acquire);
+  ngx_log_debug3(
+      NGX_LOG_DEBUG_HTTP, request.connection->log, 0,
+      "request body filter %s in chain. Current data: %lu, Stage: %d",
+      in ? "with" : "without", filter_ctx_.out_total, st);
 
   if (st == stage::AFTER_BEGIN_WAF) {
-    ngx_log_debug(NGX_LOG_DEBUG_HTTP, request.connection->log, 0,
-                  "first filter call, req refcount=%d", request.main->count);
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, request.connection->log, 0,
+                   "first filter call, req refcount=%d", request.main->count);
     // buffer the request body during reading
     // https://github.com/nginx/nginx/commit/67d160bf25e02ba6679bb6c3b9cbdfeb29b759de
     // https://nginx.org/en/docs/dev/development_guide.html#http_request_body_filters
+    // this essentially avoids early req termination if buffers are not read
+    // (position advanced) by the filters. However, nginx doesn't keep calling
+    // the filters in that case. We use it to avoid synchronous calls to the
+    // filter after we collected enough data to call the WAF. Asynchronous calls
+    // are avoided by swapping the handlers before starting the WAF task.
     request.request_body->filter_need_buffering = true;
-
-    if (ngx_chain_add_copy(request.pool, &filter_ctx_.out, in) != NGX_OK) {
-      return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
 
     if (in->buf->pos ==
         request.header_in->pos - (in->buf->last - in->buf->pos)) {
       // preread call by ngx_http_read_client_request_body.
       // read and write handlers were not set yet, so don't launch the
       // waf now. We'll do it on the next call.
-      ngx_log_debug(NGX_LOG_DEBUG_HTTP, request.connection->log, 0,
-                    "1st preread call, no waf task submission yet");
+      ngx_log_debug0(NGX_LOG_DEBUG_HTTP, request.connection->log, 0,
+                     "1st preread call, no waf task submission yet");
       st = transition_to_stage(stage::COLLECTING_ON_REQ_DATA_PREREAD);
     } else {
       st = transition_to_stage(stage::COLLECTING_ON_REQ_DATA);
     }
+  }
 
-    // continues below
-  } else if (st == stage::COLLECTING_ON_REQ_DATA_PREREAD) {
-    if (ngx_chain_add_copy(request.pool, &filter_ctx_.out, in) != NGX_OK) {
+  if (st == stage::COLLECTING_ON_REQ_DATA_PREREAD) {
+    // we're guaranteed to be called again synchronously, so we shouldn't
+    // call the WAF at this point
+
+    if (buffer_chain(*request.pool, in, true) != NGX_OK) {
       return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
     st = transition_to_stage(stage::COLLECTING_ON_REQ_DATA);
-
-    // continues below
   } else if (st == stage::COLLECTING_ON_REQ_DATA) {
-    if (ngx_chain_add_copy(request.pool, &filter_ctx_.out, in) != NGX_OK) {
-      return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    // check if we have enough data to run the WAF
+    size_t new_size = filter_ctx_.out_total;
+    bool is_last = filter_ctx_.found_last;
+    for (auto *cl = in; cl; cl = cl->next) {
+      new_size += cl->buf->last - cl->buf->pos;
+      is_last = is_last || cl->buf->last_buf;
     }
 
-    // continues below
-  } else if (st == stage::AFTER_ON_REQ_WAF ||
-             st == stage::AFTER_ON_REQ_WAF_BLOCK) {
-    if (filter_ctx_.out) {  // first call after WAF ended
-      ngx_log_debug(NGX_LOG_DEBUG_HTTP, request.connection->log, 0,
-                    "first filter call after WAF ended, req refcount=%d",
-                    request.main->count);
-      if (ngx_chain_add_copy(request.pool, &filter_ctx_.out, in) != NGX_OK) {
+    bool run_waf = new_size >= kMaxFilterData || is_last;
+    if (run_waf) {
+      // do not consume the buffer so that this filter is not called again
+      if (buffer_chain(*request.pool, in, false) != NGX_OK) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
       }
 
-      // pass saved buffers downstream
-      auto rc = ngx_http_next_request_body_filter(&request, filter_ctx_.out);
-
-      for (auto *cl = filter_ctx_.out; cl;) {
-        auto *ln = cl;
-        cl = cl->next;
-        ngx_free_chain(request.pool, ln);
+      if (filter_ctx_.out_total == 0) {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, request.connection->log, 0,
+                       "no data to run WAF on");
+        transition_to_stage(stage::AFTER_ON_REQ_WAF);
+        goto pass_downstream;
       }
-      filter_ctx_.out = nullptr;
 
-      return rc;
-    }
+      ngx_log_debug2(NGX_LOG_DEBUG_HTTP, request.connection->log, 0,
+                     "running WAF on %lu bytes of data (found last: %s)",
+                     new_size, is_last ? "true" : "false");
 
-    return ngx_http_next_request_body_filter(&request, in);
-  } else if (st == stage::SUSPENDED_ON_REQ_WAF) {
-    ngx_log_error(NGX_LOG_NOTICE, request.connection->log, 0,
-                  "unexpected filter call in stage SUSPENDED_ON_REQ_WAF");
-    if (ngx_chain_add_copy(request.pool, &filter_ctx_.out, in) != NGX_OK) {
-      return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-  } else {
-    ngx_log_error(NGX_LOG_NOTICE, request.connection->log, 0,
-                  "unexpected filter call in stage %d", st);
-    return ngx_http_next_request_body_filter(&request, in);
-  }
-
-  if (st == stage::COLLECTING_ON_REQ_DATA ||
-      st == stage::COLLECTING_ON_REQ_DATA_PREREAD) {
-    // save buffers
-    for (ngx_chain_t *chain = in; chain;) {
-      filter_ctx_.out_total += ngx_buf_size(chain->buf);
-      auto *next_chain = chain->next;
-      if (next_chain == nullptr && chain->buf->last_buf) {
-        filter_ctx_.found_last |= true;
-        break;
-      }
-      chain = next_chain;
-    }
-
-    if (st == stage::COLLECTING_ON_REQ_DATA &&
-        (filter_ctx_.found_last || filter_ctx_.out_total >= kMaxFilterData)) {
-      // TODO skip if request body is empty
       PolReqBodyWafCtx &task_ctx =
           PolReqBodyWafCtx::create(request, *this, span);
 
@@ -812,11 +783,102 @@ ngx_int_t Context::do_request_body_filter(ngx_http_request_t &request,
                       "posted request body waf req post task");
       } else {
         transition_to_stage(stage::AFTER_ON_REQ_WAF);
+        ngx_log_error(NGX_LOG_NOTICE, request.connection->log, 0,
+                      "posted request body waf req post task failed. Passing "
+                      "data to downstream filters immediately");
+        goto pass_downstream;
+      }
+    } else {  // !run_waf; we need more data
+      if (buffer_chain(*request.pool, in, true) != NGX_OK) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
       }
     }
+  } else if (st == stage::AFTER_ON_REQ_WAF ||
+             st == stage::AFTER_ON_REQ_WAF_BLOCK) {
+    if (filter_ctx_.out) {  // first call after WAF ended
+      ngx_log_debug1(NGX_LOG_DEBUG_HTTP, request.connection->log, 0,
+                     "first filter call after WAF ended, req refcount=%d",
+                     request.main->count);
+      if (buffer_chain(*request.pool, in, false) != NGX_OK) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+      }
+
+    pass_downstream:
+      // pass saved buffers downstream
+      auto rc = ngx_http_next_request_body_filter(&request, filter_ctx_.out);
+
+      for (auto *cl = filter_ctx_.out; cl;) {
+        auto *ln = cl;
+        cl = cl->next;
+        ngx_free_chain(request.pool, ln);
+      }
+      filter_ctx_.out = nullptr;
+      filter_ctx_.out_last = &filter_ctx_.out;
+
+      return rc;
+    }
+
+    return ngx_http_next_request_body_filter(&request, in);
+  } else if (st == stage::SUSPENDED_ON_REQ_WAF) {
+    if (in) {
+      ngx_log_error(
+          NGX_LOG_NOTICE, request.connection->log, 0,
+          "unexpected filter call with data in stage SUSPENDED_ON_REQ_WAF");
+      // we're in a suspended state, so we don't expect to be called
+      // if we are called, it's a bit troubling, because the write that happens
+      // in the buffered chain in the next statement is not synchronized with
+      // the read that happens in the WAF thread.
+      if (buffer_chain(*request.pool, in, false) != NGX_OK) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+      }
+    }
+  } else {
+    ngx_log_error(NGX_LOG_NOTICE, request.connection->log, 0,
+                  "unexpected filter call in stage %d", st);
+    return ngx_http_next_request_body_filter(&request, in);
   }
 
+  // we continue to call the filter chain, but don't pass any data
   return ngx_http_next_request_body_filter(&request, nullptr);
+}
+
+ngx_int_t Context::buffer_chain(ngx_pool_t &pool, ngx_chain_t *in,
+                                bool consume) {
+  for (auto *in_ch = in; in_ch; in_ch = in_ch->next) {
+    ngx_chain_t *new_ch = ngx_alloc_chain_link(&pool);  // uninitialized
+    if (!new_ch) {
+      return NGX_ERROR;
+    }
+
+    auto *buf = in_ch->buf;
+    auto size = buf->last - buf->pos;
+    if (consume) {  // copy the buffer and consume the original
+      ngx_buf_t *new_buf = ngx_create_temp_buf(&pool, size);
+      if (!new_buf) {
+        return NGX_ERROR;
+      }
+
+      new_buf->last = ngx_copy(new_buf->pos, buf->pos, size);
+      buf->pos = buf->last;
+      new_buf->last_buf = buf->last_buf;
+      new_buf->tag = buf->tag;
+
+      new_ch->buf = new_buf;
+    } else {
+      new_ch->buf = buf;
+    }
+    new_ch->next = nullptr;
+
+    filter_ctx_.out_total += size;
+    if (buf->last_buf) {
+      filter_ctx_.found_last = true;
+    }
+
+    *filter_ctx_.out_last = new_ch;
+    filter_ctx_.out_last = &new_ch->next;
+  }
+
+  return NGX_OK;
 }
 
 ngx_int_t Context::do_output_body_filter(ngx_http_request_t &request,

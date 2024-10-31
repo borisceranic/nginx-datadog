@@ -84,13 +84,14 @@ class Context {
  private:
   bool do_on_request_start(ngx_http_request_t &request, dd::Span &span);
   ngx_int_t do_request_body_filter(ngx_http_request_t &request,
-                                  ngx_chain_t *chain, dd::Span &span);
+                                   ngx_chain_t *chain, dd::Span &span);
   ngx_int_t do_output_body_filter(ngx_http_request_t &request,
                                   ngx_chain_t *chain, dd::Span &span);
   void do_on_main_log_request(ngx_http_request_t &request, dd::Span &span);
 
   bool has_matches() const noexcept;
   void report_matches(ngx_http_request_t &request, dd::Span &span);
+  ngx_int_t buffer_chain(ngx_pool_t &pool, ngx_chain_t *in, bool consume);
 
   enum class stage {
     DISABLED,
@@ -109,8 +110,8 @@ class Context {
 
   std::unique_ptr<std::atomic<stage>> stage_;
   [[maybe_unused]] stage transition_to_stage(stage stage) {
-      stage_->store(stage, std::memory_order_release);
-      return stage;
+    stage_->store(stage, std::memory_order_release);
+    return stage;
   }
   [[maybe_unused]] bool checked_transition_to_stage(stage from, stage to) {
     return stage_->compare_exchange_strong(from, to, std::memory_order_acq_rel);
@@ -121,10 +122,11 @@ class Context {
   OwnedDdwafContext ctx_{nullptr};
   DdwafMemres memres_;
 
-  static inline constexpr auto kMaxFilterData = 4096 * 1024;
+  static inline constexpr auto kMaxFilterData = 40 * 1024;
 
   struct FilterCtx {
-    ngx_chain_t *out;
+    ngx_chain_t *out;  // the buffered request body
+    ngx_chain_t **out_last{&out};
     std::size_t out_total;
     bool found_last;
   };

@@ -124,7 +124,11 @@ test: build-musl
 
 .PHONY: coverage
 coverage:
-	COVERAGE=ON $(MAKE) build-musl
+	COVERAGE=ON BUILD_TESTING=ON $(MAKE) build-musl
+	docker run --init --rm --platform $(DOCKER_PLATFORM) \
+		--mount "type=bind,source=$(PWD),destination=/mnt/repo" \
+		$(DOCKER_REPOS):latest \
+		/bin/sh -c 'cd /mnt/repo/.musl-build; LLVM_PROFILE_FILE=unit_tests.profraw test/unit/unit_tests'
 	cp -v .musl-build/ngx_http_datadog_module.so* test/services/nginx/
 	rm -f test/coverage_data.tar.gz
 	test/bin/run --verbose --failfast

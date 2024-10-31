@@ -482,4 +482,15 @@ class TestSecAddresses(case.TestCase):
                               '--bound\r\nContent-Disposition: form-data; name="key"\r\n\r\nmatched value\r\n--bound--')
         self.assertEqual(
             result['triggers'][0]['rule_matches'][0]['parameters'][0]['value'],
-            'matched key')
+            'matched value')
+
+    def test_multipart_large_value(self):
+        # payload larger than 40k
+        result = self.do_post('multipart/form-data; boundary="bound"',
+                              '--bound\r\nContent-Disposition: form-data; name="key"\r\n\r\n' +
+                              'matched value\r\n' +
+                              '--bound\r\nContent-Disposition: form-data; name="key"\r\n\r\n' +
+                              ('a' * (40 * 1024)) + '\r\n--bound--\r\n')
+        self.assertEqual(
+            result['triggers'][0]['rule_matches'][0]['parameters'][0]['value'],
+            'matched value')
